@@ -13,27 +13,53 @@ SDKROOT ?= $(shell xcrun --show-sdk-path 2>/dev/null || echo /Applications/Xcode
 endif
 
 # Compiler and flags
-CFLAGS = -Wall -Wextra -O2 \
+# -Werror: treat warnings as errors (strict compilation)
+CFLAGS = -Wall -Wextra -Werror \
+    -Wstrict-prototypes \
+    -Wmissing-prototypes \
+    -Wstrict-aliasing=2 \
+    -Wcast-align \
+    -Wconversion \
+    -Wsign-conversion \
+    -Wfloat-equal \
+    -Wshadow \
+    -Wunused \
+    -Wunused-parameter \
+    -Wunused-variable \
+    -Wunused-function \
+    -Wpedantic \
+    -Wextra-semi \
+    -Wnullability-completeness \
+    -Wobjc-method-access \
+    -Wstrict-selector-match \
+    -Wundeclared-selector \
+    -Wdeprecated-implementations \
+    -Wgnu-zero-variadic-macro-arguments \
+    -Wformat-pedantic \
+    -Wdollar-in-identifier-extension \
+    -Wlanguage-extension-token \
+    -Wgnu-pointer-arith \
+    -O2 \
     -fobjc-arc \
     -isysroot $(SDKROOT) \
     -iframework $(SDKROOT)/System/Library/Frameworks \
     -F/System/Library/PrivateFrameworks \
-    -Isrc -Isrc/ZKSwizzle
+    -Isrc
 ARCHS = -arch x86_64 -arch arm64 -arch arm64e
 FRAMEWORK_PATH = $(SDKROOT)/System/Library/Frameworks
 PRIVATE_FRAMEWORK_PATH = $(SDKROOT)/System/Library/PrivateFrameworks
 PUBLIC_FRAMEWORKS = -framework Foundation -framework AppKit -framework QuartzCore -framework Cocoa \
-    -framework CoreFoundation
+    -framework CoreFoundation -framework ApplicationServices
 
 # Project name and paths
-PROJECT = hiddengem
-DYLIB_NAME = lib$(PROJECT).dylib
+PROJECT = hider
+DYLIB_NAME = libHider.dylib
 BUILD_DIR = build
 SOURCE_DIR = src
 INSTALL_DIR = /var/ammonia/core/tweaks
 
 # Source files
-DYLIB_SOURCES = $(SOURCE_DIR)/lostnfound.m $(SOURCE_DIR)/ZKSwizzle/ZKSwizzle.m
+DYLIB_SOURCES = $(SOURCE_DIR)/Hider.m
 DYLIB_OBJECTS = $(DYLIB_SOURCES:%.m=$(BUILD_DIR)/%.o)
 
 # Installation targets
@@ -65,7 +91,6 @@ compile: $(BUILD_DIR)/$(DYLIB_NAME)
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 	@mkdir -p $(BUILD_DIR)/src
-	@mkdir -p $(BUILD_DIR)/src/ZKSwizzle
 
 # Compile source files
 $(BUILD_DIR)/%.o: %.m
@@ -82,8 +107,6 @@ $(BUILD_DIR)/$(DYLIB_NAME): $(DYLIB_OBJECTS) | $(BUILD_DIR)
 	@echo "Cleaning intermediate build files..."
 	@find $(BUILD_DIR) -name "*.o" -delete
 	@find $(BUILD_DIR) -type d -empty -delete
-	@chmod -R 755 $(BUILD_DIR)
-	@chown -R admin:admin $(BUILD_DIR) 2>/dev/null || true
 	@echo "Build complete. Only $(DYLIB_NAME) remains in $(BUILD_DIR)/"
 
 # Create installer package
@@ -136,6 +159,8 @@ install: $(BUILD_DIR)/$(DYLIB_NAME)
 		echo "Warning: $(BLACKLIST_SOURCE) not found"; \
 		echo "Installed $(DYLIB_NAME)"; \
 	fi
+	@echo "Force quitting Dock to reload tweak..."
+	sudo killall Dock 2>/dev/null || true
 
 # Test target that compiles, installs, and kills dock for testing
 test: $(BUILD_DIR)/$(DYLIB_NAME)
@@ -152,9 +177,34 @@ test: $(BUILD_DIR)/$(DYLIB_NAME)
 		echo "Warning: $(BLACKLIST_SOURCE) not found"; \
 		echo "Installed $(DYLIB_NAME)"; \
 	fi
+	@echo "Clearing previous log file..."
+	@rm -f /tmp/hider.log
 	@echo "Force quitting Dock to reload tweak..."
 	killall Dock 2>/dev/null || true
+	@sleep 1
 	@echo "Dock restarted with new tweak loaded"
+	@echo ""
+	@echo "=== Tailing /tmp/hider.log ==="
+	@if [ -f /tmp/hider.log ]; then \
+		echo "Showing existing log content:"; \
+		cat /tmp/hider.log; \
+		echo ""; \
+		echo "Tailing log file (Ctrl+C to stop)..."; \
+		tail -f /tmp/hider.log; \
+	else \
+		echo "Log file not found yet. Waiting 2 seconds and trying again..."; \
+		sleep 2; \
+		if [ -f /tmp/hider.log ]; then \
+			echo "Showing existing log content:"; \
+			cat /tmp/hider.log; \
+			echo ""; \
+			echo "Tailing log file (Ctrl+C to stop)..."; \
+			tail -f /tmp/hider.log; \
+		else \
+			echo "Log file still not found. Dock may not have loaded the tweak yet."; \
+			echo "Check /tmp/hider.log manually or restart Dock again."; \
+		fi \
+	fi
 
 # Clean build files
 clean:
@@ -182,4 +232,4 @@ uninstall:
 
 # verbose test
 ## log show --predicate 'process == "Dock"' --info --last 2m | tail -30
-# log show --predicate 'process == "Dock" AND eventMessage CONTAINS "HiddenGem"' --info --last 2m 
+# log show --predicate 'process == "Dock" AND eventMessage CONTAINS "Hider"' --info --last 2m

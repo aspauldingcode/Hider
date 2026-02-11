@@ -6,7 +6,15 @@
 //  Copyright (c) 2014 Alexander S Zielenski. All rights reserved.
 //
 
+// Suppress warnings from ZKSwizzle framework code that we can't modify
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-pointer-arith"
+#pragma clang diagnostic ignored "-Wsign-conversion"
+#pragma clang diagnostic ignored "-Wdollar-in-identifier-extension"
+#pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+
 #import "ZKSwizzle.h"
+
 static NSMutableDictionary *classTable;
 
 @interface NSObject (ZKSwizzle)
@@ -37,7 +45,8 @@ static Class classFromInfo(const char *info) {
     }
     
     char after_bracket[255];
-    memcpy(after_bracket, &info[bracket_index], strlen(info) - bracket_index - 1);
+    size_t copy_len = (size_t)(strlen(info) - bracket_index - 1);
+    memcpy(after_bracket, &info[bracket_index], copy_len);
     
     for (NSUInteger i = 0; i < strlen(info); i++) {
         if (after_bracket[i] == ' ') {
@@ -289,3 +298,5 @@ BOOL _ZKSwizzleGroup(const char *groupName) {
     
     return success;
 }
+
+#pragma clang diagnostic pop

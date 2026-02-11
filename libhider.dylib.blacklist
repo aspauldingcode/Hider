@@ -3,3 +3,8 @@ com.apple.Spotlight
 com.apple.SystemUIServer
 com.apple.screencaptureui
 com.vmware.vmware-vmx
+com.mitchellh.ghostty
+com.apple.Terminal
+com.kitware.trae
+com.apple.dt.Xcode
+com.apple.Safari

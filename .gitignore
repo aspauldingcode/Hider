@@ -1,7 +1,3 @@
-# Reference projects (not part of the HiddenGem tweak)
-poc1/
-poc2/
-
 # Build artifacts
 build/
 *.o
@@ -77,3 +73,6 @@ yarn-error.log*
 *.tar.gz
 *.rar
 *.7z
+
+# Packages
+*.pkg

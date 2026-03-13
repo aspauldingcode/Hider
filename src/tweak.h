@@ -120,6 +120,7 @@ extern CoreDockTileInfo *CoreDockGetTileInfoForBundle(CFStringRef bundleID);
 #define kCoreDockNotificationTileRemoved CFSTR("com.apple.dock.tile.removed")
 #define kCoreDockNotificationTileChanged CFSTR("com.apple.dock.tile.changed")
 #define kCoreDockNotificationDockChanged CFSTR("com.apple.dock.changed")
+#define kCoreDockNotificationPreferencesChanged CFSTR("com.apple.dock.prefschanged")
 
 // Special Bundle IDs
 #define kCoreDockFinderBundleID CFSTR("com.apple.finder")

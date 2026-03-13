@@ -16,9 +16,8 @@ The end..
 
 Must partially disable SIP. You know, the "usual". 
 
-## Credits
-
 -   Alex Spaulding (@aspauldingcode)
+-   Salty (@ogui-775) - Dock tile rendering bugfix suggestion
 
 ## License
 

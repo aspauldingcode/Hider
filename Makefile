@@ -62,8 +62,14 @@ INSTALL_DIR = /var/ammonia/core/tweaks
 DYLIB_SOURCES = $(SOURCE_DIR)/Hider.m
 DYLIB_OBJECTS = $(DYLIB_SOURCES:%.m=$(BUILD_DIR)/%.o)
 
+APP_SOURCES = $(SOURCE_DIR)/HiderApp.swift $(SOURCE_DIR)/SettingsManager.swift
+APP_NAME = Hider
+APP_BINARY = $(BUILD_DIR)/$(APP_NAME)
+APP_ID = com.aspauldingcode.hider
+
 # Installation targets
 INSTALL_PATH = $(INSTALL_DIR)/$(DYLIB_NAME)
+BIN_INSTALL_DIR = /usr/local/bin
 BLACKLIST_SOURCE = lib$(PROJECT).dylib.blacklist
 BLACKLIST_DEST = $(INSTALL_DIR)/lib$(PROJECT).dylib.blacklist
 
@@ -81,11 +87,12 @@ DYLIB_FLAGS = -dynamiclib \
               -compatibility_version 1.0.0 \
               -current_version 1.0.0
 
-# Default target - build the dylib
-all: $(BUILD_DIR)/$(DYLIB_NAME)
+# Default target - build the dylib and the app
+# Default target - build the dylib and the app binary
+all: $(BUILD_DIR)/$(DYLIB_NAME) $(APP_BINARY)
 
-# Explicit build target (same as all)
-compile: $(BUILD_DIR)/$(DYLIB_NAME)
+# Explicit build target
+compile: all
 
 # Create build directory and subdirectories
 $(BUILD_DIR):
@@ -108,6 +115,14 @@ $(BUILD_DIR)/$(DYLIB_NAME): $(DYLIB_OBJECTS) | $(BUILD_DIR)
 	@find $(BUILD_DIR) -name "*.o" -delete
 	@find $(BUILD_DIR) -type d -empty -delete
 	@echo "Build complete. Only $(DYLIB_NAME) remains in $(BUILD_DIR)/"
+
+# Build SwiftUI App Binary
+$(APP_BINARY): $(APP_SOURCES) | $(BUILD_DIR)
+	@echo "Building SwiftUI Binary..."
+	swiftc -sdk $(SDKROOT) $(APP_SOURCES) \
+		-o $(APP_BINARY) \
+		-emit-executable
+	@echo "App binary build complete: $(APP_BINARY)"
 
 # Create installer package
 installER: $(BUILD_DIR)/$(DYLIB_NAME)
@@ -145,12 +160,15 @@ installER: $(BUILD_DIR)/$(DYLIB_NAME)
 	@echo "Installer package created: $(PKG_FILE)"
 
 # Install by compiling first and then installing directly
-install: $(BUILD_DIR)/$(DYLIB_NAME)
+install: all
 	@echo "Installing dylib directly to $(INSTALL_DIR)"
 	# Create the target directory.
 	sudo mkdir -p $(INSTALL_DIR)
 	# Install the tweak's dylib where injection takes place.
 	sudo install -m 755 $(BUILD_DIR)/$(DYLIB_NAME) $(INSTALL_DIR)
+	@echo "Installing Hider binary to $(BIN_INSTALL_DIR)"
+	sudo mkdir -p $(BIN_INSTALL_DIR)
+	sudo install -m 755 $(APP_BINARY) $(BIN_INSTALL_DIR)
 	@if [ -f $(BLACKLIST_SOURCE) ]; then \
 		sudo cp $(BLACKLIST_SOURCE) $(BLACKLIST_DEST); \
 		sudo chmod 644 $(BLACKLIST_DEST); \

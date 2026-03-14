@@ -330,19 +330,41 @@ static void Hider_HideFloorSeparators(CALayer *layer) {
     return;
   }
 
-  BOOL hideAll = g_hideSeparators || (g_separatorMode == 1) || g_deferSeparatorRestore;
+  BOOL hideAll = g_hideSeparators || (g_separatorMode == 1);
+  BOOL hideRightmostOnly = (g_separatorMode == 2) &&
+                          (g_trashHidden || g_deferSeparatorRestore);
+
+  // In auto mode with trash hidden: only hide the rightmost separator (the one
+  // left of the Trash).  Find it by max position (rightmost in layout).
+  CALayer *rightmostSeparator = nil;
+  if (hideRightmostOnly) {
+    CGFloat maxRight = -CGFLOAT_MAX;
+    for (CALayer *sub in layer.sublayers) {
+      NSString *subClass = NSStringFromClass([sub class]);
+      if ([subClass containsString:@"Indicator"])
+        continue;
+      if (sub.frame.size.width > 0 && sub.frame.size.width < 15) {
+        CGFloat right = sub.frame.origin.x + sub.frame.size.width;
+        if (right > maxRight) {
+          maxRight = right;
+          rightmostSeparator = sub;
+        }
+      }
+    }
+  }
 
   for (CALayer *sub in layer.sublayers) {
     NSString *subClass = NSStringFromClass([sub class]);
     if ([subClass containsString:@"Indicator"])
       continue;
     if (sub.frame.size.width > 0 && sub.frame.size.width < 15) {
-      BOOL shouldHide = hideAll;
-
-      if (g_separatorMode == 2) {
-        if (g_trashHidden || g_deferSeparatorRestore) {
-          shouldHide = YES;
+      BOOL shouldHide = hideAll ? YES : (hideRightmostOnly && (sub == rightmostSeparator));
+      if (hideRightmostOnly && !shouldHide) {
+        if (sub.hidden) {
+          [sub setHidden:NO];
+          [sub setOpacity:1.0f];
         }
+        continue;
       }
 
       if (shouldHide) {
@@ -779,11 +801,6 @@ static void Hider_RefreshDock(void) {
 
   // ── Trash ───────────────────────────────────────────────────────────────────
   // No pref key for Trash; use doCommand:1004/1003 exclusively.
-  if (trashBecameHidden && g_trashTileObject) {
-    LOG_TO_FILE("Trash: sending doCommand:1004 (remove)");
-    if ([g_trashTileObject respondsToSelector:dc])
-      ((void (*)(id, SEL, int))objc_msgSend)(g_trashTileObject, dc, 1004);
-  }
   if (trashBecameVisible && g_trashTileObject) {
     LOG_TO_FILE("Trash: sending doCommand:1003 (add)");
     if ([g_trashTileObject respondsToSelector:dc])
@@ -799,29 +816,17 @@ static void Hider_RefreshDock(void) {
   }
 
   // ── Separators ──────────────────────────────────────────────────────────────
+  // Auto mode (g_separatorMode == 2, triggered by g_trashHidden): only the
+  // built-in DOCKSeparatorTile (rightmost, left of Trash) is hidden and
+  // removed from the dock.  User-added spacer tiles are never modified.
+  // Explicit mode (g_separatorMode == 1) retains the full prefs-removal path.
   if (shouldRemoveSeparators && !prevShouldRemoveSeps) {
-    // Snapshot + remove spacer-tile entries from plist (enables pref-based restore).
-    Hider_RemoveSeparatorsFromPrefs();
-    // Also fire doCommand:1004 on each tracked separator tile for immediacy.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    SEL pc = NSSelectorFromString(@"performCommand:");
-    for (id tile in g_separatorTileObjects) {
-      if ([tile respondsToSelector:dc]) {
-        ((void (*)(id, SEL, int))objc_msgSend)(tile, dc, 1004);
-      } else {
-        id d = [tile respondsToSelector:@selector(delegate)]
-                   ? [tile performSelector:@selector(delegate)]
-                   : nil;
-        if (d && [d respondsToSelector:pc])
-          ((void (*)(id, SEL, int))objc_msgSend)(d, pc, 1004);
-      }
+    if (g_separatorMode == 1 || g_hideSeparators) {
+      Hider_RemoveSeparatorsFromPrefs();
     }
-#pragma clang diagnostic pop
   } else if (!shouldRemoveSeparators && prevShouldRemoveSeps) {
-    // Defer the plist restore — keep separators hidden in this Dock session.
-    // They will be written back to com.apple.dock prefs by the prepareRestart
-    // notification handler, just before killall Dock is called.
+    // Keep the floor separator / DOCKSeparatorTile hidden in this session
+    // until the user restarts the Dock.
     g_deferSeparatorRestore = YES;
   }
 
@@ -877,6 +882,96 @@ static void Hider_RefreshDock(void) {
                  dispatch_get_main_queue(), applyPass);
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_MSEC),
                  dispatch_get_main_queue(), applyPass);
+
+  // Staggered sequence when hiding trash: 1) trash invisible (layout above),
+  // 2) remove trash tile, 3) rightmost separator invisible (layout), 4) remove
+  // rightmost separator tile only.
+  if (trashBecameHidden && g_trashTileObject) {
+    id trashTile = g_trashTileObject;
+    const int step2Ms = 60;
+    const int step4Ms = 120;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(step2Ms * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+      SEL d = NSSelectorFromString(@"doCommand:");
+      SEL pc = NSSelectorFromString(@"performCommand:");
+      // Capture trash frame in a common coordinate system before removing.
+      // Use trash's window contentView so all tiles convert to the same space.
+      NSView *refView = nil;
+      if ([trashTile isKindOfClass:[NSView class]]) {
+        refView = [(NSView *)trashTile window].contentView;
+      } else if ([trashTile isKindOfClass:[CALayer class]]) {
+        id del = [(CALayer *)trashTile delegate];
+        if ([del isKindOfClass:[NSView class]])
+          refView = [(NSView *)del window].contentView;
+      }
+      CGRect trashFrame = CGRectZero;
+      if ([trashTile isKindOfClass:[NSView class]] && refView) {
+        trashFrame = [(NSView *)trashTile convertRect:[(NSView *)trashTile bounds] toView:refView];
+      } else if ([trashTile isKindOfClass:[CALayer class]] && refView) {
+        CALayer *trashLayer = (CALayer *)trashTile;
+        id del = trashLayer.delegate;
+        if ([del isKindOfClass:[NSView class]])
+          trashFrame = [(NSView *)del convertRect:trashLayer.bounds toView:refView];
+      }
+      BOOL useHorizontal = (trashFrame.size.width >= trashFrame.size.height);
+      // 2. Remove trash dock tile
+      if ([trashTile respondsToSelector:d])
+        ((void (*)(id, SEL, int))objc_msgSend)(trashTile, d, 1004);
+      // 3. Trigger layout so rightmost separator gets hidden
+      applyPass();
+      // 4. Remove only the rightmost live DOCKSeparatorTile.
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((step4Ms - step2Ms) * NSEC_PER_MSEC)),
+                     dispatch_get_main_queue(), ^{
+                       id rightmost = nil;
+                       CGFloat maxRight = -CGFLOAT_MAX;
+                       for (id tile in g_separatorTileObjects) {
+                         if (![NSStringFromClass([tile class]) isEqualToString:@"DOCKSeparatorTile"])
+                           continue;
+                         NSView *tileView = nil;
+                         if ([tile isKindOfClass:[NSView class]]) {
+                           tileView = (NSView *)tile;
+                         } else if ([tile isKindOfClass:[CALayer class]]) {
+                           id del = [(CALayer *)tile delegate];
+                           if ([del isKindOfClass:[NSView class]])
+                             tileView = (NSView *)del;
+                         }
+                         if (!tileView || !refView || tileView.window != refView.window)
+                           continue;
+                         CGRect frame = [tileView convertRect:tileView.bounds toView:refView];
+                         if (CGRectIsEmpty(frame))
+                           continue;
+                         CGFloat key = useHorizontal ? CGRectGetMaxX(frame)
+                                                     : CGRectGetMaxY(frame);
+                         if (key > maxRight) {
+                           maxRight = key;
+                           rightmost = tile;
+                         }
+                       }
+                       if (!rightmost) {
+                         for (id tile in [g_separatorTileObjects reverseObjectEnumerator]) {
+                           if ([NSStringFromClass([tile class]) isEqualToString:@"DOCKSeparatorTile"]) {
+                             rightmost = tile;
+                             break;
+                           }
+                         }
+                       }
+                       if (rightmost) {
+                         if ([rightmost respondsToSelector:d])
+                           ((void (*)(id, SEL, int))objc_msgSend)(rightmost, d, 1004);
+                         else {
+                           id del = [rightmost respondsToSelector:@selector(delegate)]
+                                       ? [rightmost performSelector:@selector(delegate)]
+                                       : nil;
+                           if (del && [del respondsToSelector:pc])
+                             ((void (*)(id, SEL, int))objc_msgSend)(del, pc, 1004);
+                         }
+                       }
+                     });
+                   });
+#pragma clang diagnostic pop
+  }
 
   g_prevFinderHidden      = g_finderHidden;
   g_prevTrashHidden       = g_trashHidden;
@@ -1323,6 +1418,11 @@ static void swizzleDOCKFileTile(Class cls) {
 }
 
 static void swizzleDOCKSpacerTile(Class cls) {
+  // Determine once at swizzle time: DOCKSeparatorTile is the built-in
+  // irremovable section divider between persistent-apps and persistent-others
+  // (left of Trash). DOCKSpacerTile is a user-added spacer — never touched.
+  BOOL isSeparatorTile = strcmp(class_getName(cls), "DOCKSeparatorTile") == 0;
+
   SEL sel = NSSelectorFromString(@"update");
   if (![cls instancesRespondToSelector:sel])
     sel = NSSelectorFromString(@"updateRect");
@@ -1333,8 +1433,6 @@ static void swizzleDOCKSpacerTile(Class cls) {
     return;
   __block IMP orig = method_getImplementation(m);
   id (^block)(id) = ^id(id self) {
-    // Register this tile object so Hider_RefreshDock can send doCommand:1004
-    // to it when g_hideSeparators changes (driven centrally, not per-update).
     if (!g_separatorTileObjects)
       g_separatorTileObjects = [NSMutableArray array];
     if (![g_separatorTileObjects containsObject:self])
@@ -1355,6 +1453,10 @@ static void swizzleDOCKSpacerTile(Class cls) {
     Hider_SwizzleInstanceMethod(
         cls, setHiddenSel, NSSelectorFromString(@"hider_spacer_setHidden:"),
         imp_implementationWithBlock(^(id self, BOOL h) {
+          if (!isSeparatorTile) {
+            ((void (*)(id, SEL, BOOL))origSH)(self, setHiddenSel, h);
+            return;
+          }
           BOOL hide = g_hideSeparators ||
                       (g_separatorMode == 1) ||
                       (g_separatorMode == 2 && g_trashHidden) ||
@@ -1370,7 +1472,10 @@ static void swizzleDOCKSpacerTile(Class cls) {
       Hider_SwizzleInstanceMethod(
           cls, setAlphaSel, NSSelectorFromString(@"hider_spacer_setAlpha:"),
           imp_implementationWithBlock(^(id self, CGFloat a) {
-            if (g_hideSeparators || g_deferSeparatorRestore)
+            if (isSeparatorTile &&
+                (g_hideSeparators ||
+                 (g_separatorMode == 2 && g_trashHidden) ||
+                 g_deferSeparatorRestore))
               ((void (*)(id, SEL, CGFloat))origSA)(self, setAlphaSel, 0.0);
             else
               ((void (*)(id, SEL, CGFloat))origSA)(self, setAlphaSel, a);
@@ -1383,8 +1488,11 @@ static void swizzleDOCKSpacerTile(Class cls) {
       Hider_SwizzleInstanceMethod(
           cls, drawRectSel, NSSelectorFromString(@"hider_spacer_drawRect:"),
           imp_implementationWithBlock(^(id self, NSRect r) {
-            if (g_hideSeparators || g_deferSeparatorRestore) {
-              /* suppress separator drawing */
+            if (isSeparatorTile &&
+                (g_hideSeparators ||
+                 (g_separatorMode == 2 && g_trashHidden) ||
+                 g_deferSeparatorRestore)) {
+              /* suppress built-in separator drawing */
             } else {
               ((void (*)(id, SEL, NSRect))origDR)(self, drawRectSel, r);
             }
@@ -1401,7 +1509,10 @@ static void swizzleDOCKSpacerTile(Class cls) {
         NSSelectorFromString(@"hider_spacer_layoutSublayers:"),
         imp_implementationWithBlock(^(id self) {
           ((void (*)(id, SEL))origLayout)(self, layoutSublayersSel);
-          if (g_hideSeparators || g_deferSeparatorRestore) {
+          if (isSeparatorTile &&
+              (g_hideSeparators ||
+               (g_separatorMode == 2 && g_trashHidden) ||
+               g_deferSeparatorRestore)) {
             if ([self isKindOfClass:[CALayer class]]) {
               [(CALayer *)self setHidden:YES];
               [(CALayer *)self setOpacity:0.0f];

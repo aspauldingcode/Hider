@@ -4,15 +4,13 @@
 
 # Hider
 
-Hider tweak hides Finder and Trash icons out of the box. Uses Ammonia Injector.
+Hider tweak _Hides_ Finder (oh, the irony) and Trash icons. Uses Ammonia Injector.
 
 ## Installation
 
 1. Clone this repository
 2. run `make install`
 3. to uninstall, you could use `make uninstall`. 
-
-The end..
 
 Must partially disable SIP. You know, the "usual". 
 

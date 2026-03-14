@@ -70,8 +70,10 @@ APP_ID = com.aspauldingcode.hider
 # Installation targets
 INSTALL_PATH = $(INSTALL_DIR)/$(DYLIB_NAME)
 BIN_INSTALL_DIR = /usr/local/bin
-BLACKLIST_SOURCE = lib$(PROJECT).dylib.blacklist
-BLACKLIST_DEST = $(INSTALL_DIR)/lib$(PROJECT).dylib.blacklist
+WHITELIST_SOURCE = lib$(PROJECT).dylib.whitelist
+WHITELIST_DEST = $(INSTALL_DIR)/lib$(PROJECT).dylib.whitelist
+LAUNCH_AGENT_PLIST = com.aspauldingcode.hider.plist
+LAUNCH_AGENT_DEST = $(HOME)/Library/LaunchAgents/$(LAUNCH_AGENT_PLIST)
 
 # Installer package settings
 PKG_NAME = $(PROJECT)-installer
@@ -117,9 +119,10 @@ $(BUILD_DIR)/$(DYLIB_NAME): $(DYLIB_OBJECTS) | $(BUILD_DIR)
 	@echo "Build complete. Only $(DYLIB_NAME) remains in $(BUILD_DIR)/"
 
 # Build SwiftUI App Binary
-$(APP_BINARY): $(APP_SOURCES) | $(BUILD_DIR)
+$(APP_BINARY): $(APP_SOURCES) $(SOURCE_DIR)/notify_bridge.c $(SOURCE_DIR)/Hider-Bridging-Header.h | $(BUILD_DIR)
 	@echo "Building SwiftUI Binary..."
-	swiftc -sdk $(SDKROOT) $(APP_SOURCES) \
+	swiftc -sdk $(SDKROOT) -import-objc-header $(SOURCE_DIR)/Hider-Bridging-Header.h \
+		$(APP_SOURCES) $(SOURCE_DIR)/notify_bridge.c \
 		-o $(APP_BINARY) \
 		-emit-executable
 	@echo "App binary build complete: $(APP_BINARY)"
@@ -134,10 +137,10 @@ installER: $(BUILD_DIR)/$(DYLIB_NAME)
 	@cp $(BUILD_DIR)/$(DYLIB_NAME) $(PKG_ROOT)$(INSTALL_DIR)/
 	@chmod 755 $(PKG_ROOT)$(INSTALL_DIR)/$(DYLIB_NAME)
 	
-	# Copy blacklist if it exists
-	@if [ -f $(BLACKLIST_SOURCE) ]; then \
-		cp $(BLACKLIST_SOURCE) $(PKG_ROOT)$(INSTALL_DIR)/; \
-		chmod 644 $(PKG_ROOT)$(INSTALL_DIR)/$(BLACKLIST_SOURCE); \
+	# Copy whitelist if it exists
+	@if [ -f $(WHITELIST_SOURCE) ]; then \
+		cp $(WHITELIST_SOURCE) $(PKG_ROOT)$(INSTALL_DIR)/; \
+		chmod 644 $(PKG_ROOT)$(INSTALL_DIR)/$(WHITELIST_SOURCE); \
 	fi
 	
 	# Create postinstall script
@@ -168,17 +171,24 @@ install: all
 	sudo install -m 755 $(BUILD_DIR)/$(DYLIB_NAME) $(INSTALL_DIR)
 	@echo "Installing Hider binary to $(BIN_INSTALL_DIR)"
 	sudo mkdir -p $(BIN_INSTALL_DIR)
-	sudo install -m 755 $(APP_BINARY) $(BIN_INSTALL_DIR)
-	@if [ -f $(BLACKLIST_SOURCE) ]; then \
-		sudo cp $(BLACKLIST_SOURCE) $(BLACKLIST_DEST); \
-		sudo chmod 644 $(BLACKLIST_DEST); \
-		echo "Installed $(DYLIB_NAME) and blacklist"; \
+	sudo install -m 755 $(APP_BINARY) $(BIN_INSTALL_DIR)/hider
+	sudo install -m 755 $(APP_BINARY) $(BIN_INSTALL_DIR)/Hider
+	@if [ -f $(WHITELIST_SOURCE) ]; then \
+		sudo cp $(WHITELIST_SOURCE) $(WHITELIST_DEST); \
+		sudo chmod 644 $(WHITELIST_DEST); \
+		echo "Installed $(DYLIB_NAME) and whitelist"; \
 	else \
-		echo "Warning: $(BLACKLIST_SOURCE) not found"; \
+		echo "Warning: $(WHITELIST_SOURCE) not found"; \
 		echo "Installed $(DYLIB_NAME)"; \
 	fi
+	@echo "Installing launch agent to $(LAUNCH_AGENT_DEST)"
+	@mkdir -p $(HOME)/Library/LaunchAgents
+	@cp $(LAUNCH_AGENT_PLIST) $(LAUNCH_AGENT_DEST)
+	@launchctl unload $(LAUNCH_AGENT_DEST) 2>/dev/null || true
+	@launchctl load $(LAUNCH_AGENT_DEST)
+	@echo "Launch agent installed. Hider will start at login."
 	@echo "Force quitting Dock to reload tweak..."
-	sudo killall Dock 2>/dev/null || true
+	sudo killall -9 Dock 2>/dev/null || true
 
 # Test target that compiles, installs, and kills dock for testing
 test: $(BUILD_DIR)/$(DYLIB_NAME)
@@ -187,12 +197,12 @@ test: $(BUILD_DIR)/$(DYLIB_NAME)
 	sudo mkdir -p $(INSTALL_DIR)
 	# Install the tweak's dylib where injection takes place.
 	sudo install -m 755 $(BUILD_DIR)/$(DYLIB_NAME) $(INSTALL_DIR)
-	@if [ -f $(BLACKLIST_SOURCE) ]; then \
-		sudo cp $(BLACKLIST_SOURCE) $(BLACKLIST_DEST); \
-		sudo chmod 644 $(BLACKLIST_DEST); \
-		echo "Installed $(DYLIB_NAME) and blacklist"; \
+	@if [ -f $(WHITELIST_SOURCE) ]; then \
+		sudo cp $(WHITELIST_SOURCE) $(WHITELIST_DEST); \
+		sudo chmod 644 $(WHITELIST_DEST); \
+		echo "Installed $(DYLIB_NAME) and whitelist"; \
 	else \
-		echo "Warning: $(BLACKLIST_SOURCE) not found"; \
+		echo "Warning: $(WHITELIST_SOURCE) not found"; \
 		echo "Installed $(DYLIB_NAME)"; \
 	fi
 	@echo "Clearing previous log file..."
@@ -233,17 +243,23 @@ clean:
 delete:
 	@echo "Force quitting Dock..."
 	killall Dock 2>/dev/null || true
+	@launchctl unload $(LAUNCH_AGENT_DEST) 2>/dev/null || true
+	@rm -f $(LAUNCH_AGENT_DEST)
 	@sudo rm -f $(INSTALL_PATH)
-	@sudo rm -f $(BLACKLIST_DEST)
-	@echo "Deleted $(DYLIB_NAME) and blacklist from $(INSTALL_DIR)"
+	@sudo rm -f $(WHITELIST_DEST)
+	@sudo rm -f $(INSTALL_DIR)/lib$(PROJECT).dylib.blacklist
+	@echo "Deleted $(DYLIB_NAME), whitelist, and launch agent"
 
 # Uninstall
 uninstall:
 	@echo "Force quitting Dock..."
 	killall Dock 2>/dev/null || true
+	@launchctl unload $(LAUNCH_AGENT_DEST) 2>/dev/null || true
+	@rm -f $(LAUNCH_AGENT_DEST)
 	@sudo rm -f $(INSTALL_PATH)
-	@sudo rm -f $(BLACKLIST_DEST)
-	@echo "Uninstalled $(DYLIB_NAME) and blacklist"
+	@sudo rm -f $(WHITELIST_DEST)
+	@sudo rm -f $(INSTALL_DIR)/lib$(PROJECT).dylib.blacklist
+	@echo "Uninstalled $(DYLIB_NAME), whitelist, and launch agent"
 
 .PHONY: all clean install installER test delete uninstall compile
 

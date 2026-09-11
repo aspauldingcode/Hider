@@ -13,6 +13,9 @@
 #import <notify.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <float.h>
+#import <stddef.h>
+#import <stdint.h>
 
 #pragma mark - Utils Prototypes
 
@@ -63,9 +66,11 @@ static BOOL g_prevSeparatorsRemoved = NO;
 static NSSet   *g_hiddenAppBundleIDs   = nil;
 static NSSet   *g_prevHiddenAppBundleIDs = nil;
 // Tile objects for custom hidden apps: normalized-bundleID → tile model object.
-static NSMutableDictionary *g_customAppTileObjects = nil;
+// Running-app hiding is deliberately opt-in.  A panic breadcrumb left behind
+// by an interrupted mutation disables it on the next Dock launch.
+static BOOL g_runHideSafeMode = NO;
+static int64_t g_launchGen = 0;
 // Key used by Hider_RunOnce to mark that doCommand:1004 was sent for a tile.
-static const char kHiderCustomAppRemoveKey = '\0';
 
 // Associated-object keys for tagging individual tile/layer objects with
 // durable per-object state that survives across swizzle hops.
@@ -75,7 +80,6 @@ static const char kHiderCustomAppRemoveKey = '\0';
 // - kHiderSlotSuppressed: attached to slot-container CALayers → @YES when
 //   the slot is actively suppressed. Enforced in setHidden:/setOpacity:
 //   swizzles so the Dock cannot restore visibility.
-static const char kHiderBundleIDTag;
 static const char kHiderSlotSuppressed;
 
 // Helper functions
@@ -93,7 +97,11 @@ static NSString *Hider_NormalizeBundleID(NSString *bid);
 
 // Tile registry: tag tile-model objects with their resolved bundle ID and
 // populate g_customAppTileObjects for both forward and reverse lookup.
-static void Hider_RegisterTile(id tile, NSString *bid);
+
+// Crash-bounded running-app hiding.
+static BOOL Hider_RunHideActive(void);
+static BOOL Hider_RunHideBudgetOK(void);
+static BOOL Hider_IsDOCKProcessTile(id object);
 
 // Resolve the bundle ID for a DOCKTileLayer, trying Hider_GetBundleID first,
 // then the associated-object tag on the delegate, then g_customAppTileObjects
@@ -101,20 +109,16 @@ static void Hider_RegisterTile(id tile, NSString *bid);
 static NSString *Hider_ResolveBundleIDForLayer(CALayer *layer);
 
 // Resolve hidden-app bundle ID from tile delegate's PID (fallback).
-static NSString *Hider_ResolveBundleIDByPID(id delegate);
 
 // Single-point query: should this DOCKTileLayer be force-hidden?
 static BOOL Hider_ShouldForceHideLayer(CALayer *layer);
 
 // Slot-container suppression: tag a slot layer and hide it and all siblings.
 static void Hider_SuppressSlot(CALayer *tileLayer);
-static void Hider_UnsuppressSlot(CALayer *slot);
 static BOOL Hider_IsSlotSuppressed(CALayer *layer);
 
 // Unified enforcement: discover tiles, suppress, remove across all windows.
-static void Hider_EnforceHiddenApps(NSString * _Nullable singleBID, pid_t pid);
 // Hotload hidden-app list changes immediately.
-static void Hider_HotloadHiddenAppsNow(void);
 
 // Execution guard
 void Hider_RunOnce(id object, const void *key, void (^block)(void));
@@ -123,17 +127,13 @@ void Hider_RunOnce(id object, const void *key, void (^block)(void));
 static void Hider_ApplyEdgeTileVisibility(CALayer *parent);
 void Hider_ForceLayoutRecursive(CALayer *layer);
 static void Hider_ApplyVisibilityRecursive(CALayer *layer);
-static void Hider_SuppressTileRender(id tile);
 static void Hider_TriggerLayoutOnTrackedLayers(void);
 static void Hider_WalkNSViewsForLayout(NSView *view);
 
 // Suppress a tile-model's visual output if it belongs to a hidden custom app.
-static void Hider_SuppressIfHidden(id tile);
 // Remove a hidden tile immediately with retries.
-static void Hider_RequestTileRemoval(id tile);
 
 // PID-based tile discovery (fallback for when Hider_GetBundleID fails)
-static void Hider_DiscoverTileByPID(CALayer *layer, NSString *bid, pid_t pid);
 
 // Layer Dumper
 void Hider_DumpLayer(CALayer *layer, int depth, NSMutableString *output);
@@ -540,164 +540,24 @@ void Hider_RunOnce(id object, const void *key, void (^block)(void)) {
 
 #pragma mark - Tile Registry + Enforcement Helpers
 
-static void Hider_RegisterTile(id tile, NSString *bid) {
-  if (!tile || !bid) return;
-  NSString *normalized = Hider_NormalizeBundleID(bid);
-  if (!normalized || normalized.length == 0) return;
-
-  // Tag the tile model with its bundleID for layer-hook reverse-lookup.
-  objc_setAssociatedObject(tile, &kHiderBundleIDTag, normalized,
-                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-  if (!g_customAppTileObjects)
-    g_customAppTileObjects = [NSMutableDictionary dictionary];
-  g_customAppTileObjects[normalized] = tile;
-}
-
 static NSString *Hider_ResolveBundleIDForLayer(CALayer *layer) {
   if (!layer) return nil;
-
-  // Fast path: direct probe.
   NSString *bid = Hider_GetBundleID(layer);
-  if (bid) return Hider_NormalizeBundleID(bid);
-
-  // Reverse-lookup via associated-object tag on the delegate.
-  id delegate = layer.delegate;
-  if (delegate) {
-    bid = objc_getAssociatedObject(delegate, &kHiderBundleIDTag);
-    if (bid) return bid;
-  }
-
-  // Pointer-comparison fallback through g_customAppTileObjects.
-  if (delegate && g_customAppTileObjects && g_hiddenAppBundleIDs.count > 0) {
-    NSSet *hiddenSnap = [g_hiddenAppBundleIDs copy];
-    for (NSString *trackedBid in hiddenSnap) {
-      if (g_customAppTileObjects[trackedBid] == delegate)
-        return trackedBid;
-    }
-  }
-  return nil;
+  return bid ? Hider_NormalizeBundleID(bid) : nil;
 }
 
-// Resolve a hidden-app's bundle ID from a tile-model object's PID.
-// When Hider_GetBundleID and associated-object tags all fail, this is the
-// last resort: extract the process ID from the delegate, look it up via
-// NSRunningApplication, and check against the hidden-app list.
-// On success the tile is registered for future fast-path lookups.
-static NSString *Hider_ResolveBundleIDByPID(id delegate) {
-  if (!delegate || g_hiddenAppBundleIDs.count == 0) return nil;
-
-  // Guard against recursion — some selectors may trigger layout/setHidden
-  // which calls back into Hider_ShouldForceHideLayer.
-  static __thread BOOL in_resolve_pid = NO;
-  if (in_resolve_pid) return nil;
-  in_resolve_pid = YES;
-
-  pid_t tilePID = 0;
-  SEL pidSels[] = {
-    NSSelectorFromString(@"processIdentifier"),
-    NSSelectorFromString(@"pid"),
-    NSSelectorFromString(@"_pid"),
-  };
-  for (int i = 0; i < 3 && tilePID <= 0; i++) {
-    if ([delegate respondsToSelector:pidSels[i]])
-      tilePID = (pid_t)((int (*)(id, SEL))objc_msgSend)(delegate, pidSels[i]);
-  }
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-  if (tilePID <= 0) {
-    SEL appSel = NSSelectorFromString(@"application");
-    if ([delegate respondsToSelector:appSel]) {
-      id ra = [delegate performSelector:appSel];
-      if ([ra isKindOfClass:[NSRunningApplication class]])
-        tilePID = [(NSRunningApplication *)ra processIdentifier];
-    }
-  }
-  if (tilePID <= 0) {
-    SEL raSel = NSSelectorFromString(@"runningApplication");
-    if ([delegate respondsToSelector:raSel]) {
-      id ra = [delegate performSelector:raSel];
-      if ([ra isKindOfClass:[NSRunningApplication class]])
-        tilePID = [(NSRunningApplication *)ra processIdentifier];
-    }
-  }
-  if (tilePID <= 0) {
-    SEL itemSel = NSSelectorFromString(@"item");
-    SEL modelSel = NSSelectorFromString(@"model");
-    id nested = nil;
-    if ([delegate respondsToSelector:itemSel])
-      nested = [delegate performSelector:itemSel];
-    else if ([delegate respondsToSelector:modelSel])
-      nested = [delegate performSelector:modelSel];
-    if (nested) {
-      for (int i = 0; i < 3 && tilePID <= 0; i++) {
-        if ([nested respondsToSelector:pidSels[i]])
-          tilePID = (pid_t)((int (*)(id, SEL))objc_msgSend)(nested, pidSels[i]);
-      }
-    }
-  }
-#pragma clang diagnostic pop
-
-  if (tilePID <= 0) {
-    in_resolve_pid = NO;
-    return nil;
-  }
-
-  NSRunningApplication *ra =
-      [NSRunningApplication runningApplicationWithProcessIdentifier:tilePID];
-  if (!ra || !ra.bundleIdentifier) {
-    in_resolve_pid = NO;
-    return nil;
-  }
-
-  NSString *normalized = Hider_NormalizeBundleID(ra.bundleIdentifier);
-  if (!normalized || !Hider_IsCustomHiddenApp(normalized)) {
-    in_resolve_pid = NO;
-    return nil;
-  }
-
-  LOG_TO_FILE("ResolveBundleIDByPID: %s pid=%d → %@",
-              class_getName([delegate class]), (int)tilePID, normalized);
-  Hider_RegisterTile(delegate, normalized);
-  in_resolve_pid = NO;
-  return normalized;
-}
-
+// Should this layer be force-hidden? True for Finder/Trash when their toggle is
+// on, or a separator when hideSeparators is on.
 static BOOL Hider_ShouldForceHideLayer(CALayer *layer) {
   NSString *bid = Hider_ResolveBundleIDForLayer(layer);
   if (bid) {
     if (Hider_IsFinder(bid) && g_finderHidden) return YES;
     if (Hider_IsTrash(bid) && g_trashHidden)   return YES;
-    if (Hider_IsCustomHiddenApp(bid))           return YES;
+    // A hidden running app is handled by prevention: its tile is refused in
+    // Hider_InsertTileHook, so it never enters the model and there is no layer
+    // to hide here.
   }
   if (g_hideSeparators && Hider_IsSeparatorTileLayer(layer)) return YES;
-
-  // PID fallback: when all bundle-ID resolution failed, extract the PID
-  // from the tile delegate and check against running hidden apps.  This is
-  // the path that catches DOCKProcessTile instances (running-only apps)
-  // whose tile model doesn't expose a bundle ID via standard selectors.
-  if (!bid && g_hiddenAppBundleIDs.count > 0) {
-    id delegate = layer.delegate;
-    if (delegate) {
-      // Throttle logging to avoid spam — only log once per delegate pointer.
-      static NSMutableSet *s_loggedDelegates = nil;
-      if (!s_loggedDelegates) s_loggedDelegates = [NSMutableSet set];
-      NSValue *ptr = [NSValue valueWithPointer:(__bridge const void *)delegate];
-      if (![s_loggedDelegates containsObject:ptr]) {
-        [s_loggedDelegates addObject:ptr];
-        LOG_TO_FILE("ShouldForceHide PID fallback: delegate=%s for DOCKTileLayer %p",
-                    class_getName([delegate class]), (__bridge void *)layer);
-      }
-
-      NSString *pidBid = Hider_ResolveBundleIDByPID(delegate);
-      if (pidBid) {
-        Hider_SuppressSlot(layer);
-        return YES;
-      }
-    }
-  }
-
   return NO;
 }
 
@@ -711,6 +571,166 @@ static NSArray<CALayer *> *Hider_SublayersSnapshot(CALayer *layer) {
   if (!layer || !layer.sublayers) return @[];
   return [layer.sublayers copy];
 }
+
+#pragma mark - Safe Running-App Hiding
+
+static BOOL Hider_RunHideActive(void) {
+  if (g_runHideSafeMode) return NO;
+  // Persistent opt-in: the `hideRunningApps` bool in the Hider prefs domain
+  // (settable via the app / `hiderctl runhide on` / `defaults write`). The
+  // /tmp/hider-run-hide file is a transient testing override.
+  Boolean keyExists = false;
+  Boolean pref = CFPreferencesGetAppBooleanValue(
+      CFSTR("hideRunningApps"), CFSTR("com.aspauldingcode.hider"), &keyExists);
+  if (keyExists && pref) return YES;
+  return [[NSFileManager defaultManager]
+      fileExistsAtPath:@"/tmp/hider-run-hide"];
+}
+
+// Running-app hiding: a hidden running app gets no Dock tile at all — no icon,
+// no gap/slot, no hit-testing, no tooltip. Every process tile (a fresh launch, or
+// an app already running when the Dock starts) enters DockBar's Swift [Tile]
+// array through the single main-thread chokepoint
+// -[DockBar insertTile:atIndex:forReason:]. For a hidden app we don't forward
+// that insert, so its tile never enters the model. A re-add re-enters the hook
+// and is skipped again, so the tile stays out.
+static void (*g_orig_insertTile)(id, SEL, id, NSInteger, id) = NULL;
+
+static BOOL Hider_ShouldRefuseTile(id tile) {
+  if (!Hider_IsDOCKProcessTile(tile)) return NO;  // never touch Finder/Trash/etc.
+  @try {
+    NSString *bid = Hider_NormalizeBundleID(Hider_GetBundleID(tile));
+    return bid.length > 0 && Hider_IsCustomHiddenApp(bid);
+  } @catch (__unused NSException *e) {
+    return NO;
+  }
+}
+
+// Count of the DockBar's bridged tiles snapshot (-1 on failure, for logging).
+static NSUInteger Hider_TilesCount(id dock) {
+  @try {
+    id t = [dock valueForKey:@"tiles"];
+    if ([t isKindOfClass:[NSArray class]]) return [(NSArray *)t count];
+  } @catch (__unused NSException *e) {}
+  return (NSUInteger)-1;
+}
+
+// insertTile:atIndex:forReason: is the single main-thread insertion chokepoint
+// for both paths a hidden running app enters the Dock: a fresh launch (reason
+// -[DockBar _handleLaunchNotification:data:]) and an app already running when the
+// Dock starts (reason -[DockBar addProcessForASN:...]). For a hidden app we don't
+// forward the insert, so the tile never enters the `tiles` array: no icon, no gap,
+// no hit-test, no tooltip. The tile object still exists (addProcessForASN's caller
+// gets its non-optional Swift return); it is just never in the model.
+static void Hider_InsertTileHook(id self, SEL _cmd, id tile, NSInteger index,
+                                 id reason) {
+  if (Hider_RunHideActive() && Hider_ShouldRefuseTile(tile) &&
+      Hider_RunHideBudgetOK()) {
+    NSString *bid = nil;
+    @try { bid = Hider_NormalizeBundleID(Hider_GetBundleID(tile)); }
+    @catch (__unused NSException *e) {}
+    LOG_TO_FILE("insertTile: SKIP insertion for hidden %@ (reason %@)",
+                bid ? bid : @"?", reason);
+    return;  // do NOT forward to the original insertTile
+  }
+  // Index clamp (crash fix). Because we skip inserts for hidden apps, the `tiles`
+  // array is SHORTER than the count DockCore assumes when it computes atIndex for
+  // a later tile. Forwarding an insert with index > count makes DockCore's Swift
+  // `array.insert(at:)` hit a precondition and CRASH the Dock (EXC_BREAKPOINT via
+  // addProcessForASN's separator-index bookkeeping). Clamp the forwarded index to
+  // the current array bounds [0, count] so a desynced index appends instead of
+  // trapping. Only touches the value when it is out of range, so normal inserts
+  // are unaffected. Guarded by run-hide so the non-hiding path is byte-identical.
+  NSInteger safeIndex = index;
+  if (Hider_RunHideActive()) {
+    NSUInteger cnt = Hider_TilesCount(self);
+    if (cnt != (NSUInteger)-1) {
+      if (safeIndex > (NSInteger)cnt) safeIndex = (NSInteger)cnt;
+      if (safeIndex < 0) safeIndex = 0;
+      if (safeIndex != index)
+        LOG_TO_FILE("insertTile: clamped desynced index %ld -> %ld (count %lu)",
+                    (long)index, (long)safeIndex, (unsigned long)cnt);
+    }
+  }
+  if (g_orig_insertTile) g_orig_insertTile(self, _cmd, tile, safeIndex, reason);
+}
+
+static void Hider_SwizzleDockBarAddTile(void) {
+  Class db = NSClassFromString(@"DockBar");
+  if (!db) return;
+  // insertTile:atIndex:forReason: is the single main-thread insertion chokepoint
+  // for both launched and already-running hidden apps. It is where prevention
+  // (skip the insert) happens.
+  if (!g_orig_insertTile) {
+    Method m = class_getInstanceMethod(
+        db, NSSelectorFromString(@"insertTile:atIndex:forReason:"));
+    if (m) {
+      g_orig_insertTile =
+          (void (*)(id, SEL, id, NSInteger, id))method_getImplementation(m);
+      method_setImplementation(m, (IMP)Hider_InsertTileHook);
+      LOG_TO_FILE("Hooked DockBar insertTile:atIndex:forReason:");
+    }
+  }
+}
+
+
+// Hang-proof circuit breaker. Any running-hide code path calls this before
+// doing work; it counts operations per 1-second window and, if the rate spikes
+// (a layout fight / feedback loop — the failure that HANGS the Dock, which the
+// crash breadcrumb cannot catch because the process never exits), trips safe
+// mode, restores every hidden tile, and returns NO so all further work stops.
+// The Dock then settles and finishes launching WITHOUT a wedge — no sudo
+// recovery needed. Rate-based so a long normal session never falsely trips.
+static int g_runHideOpsWindow = 0;
+static int g_runHideHotWindows = 0;
+static CFTimeInterval g_runHideWindowStart = 0;
+static void Hider_TripBreaker(const char *why, int n) {
+  if (g_runHideSafeMode) return;
+  g_runHideSafeMode = YES;
+  LOG_TO_FILE("Running-hide CIRCUIT BREAKER tripped (%s=%d) — disabling", why, n);
+  [[NSFileManager defaultManager]
+      removeItemAtPath:@"/tmp/hider-run-hide" error:NULL];
+}
+static BOOL Hider_RunHideBudgetOK(void) {
+  CFTimeInterval now = CACurrentMediaTime();
+  if (now - g_runHideWindowStart > 1.0) {
+    // Window boundary: log the rate (visibility: transient burst vs sustained
+    // fight) and count consecutive "hot" windows. Trip only on a SUSTAINED
+    // fight (tolerates launch-animation bursts).
+    if (g_runHideOpsWindow > 50)
+      LOG_TO_FILE("run-hide ops/window = %d (hot streak %d)",
+                  g_runHideOpsWindow, g_runHideHotWindows);
+    if (g_runHideOpsWindow > 400) g_runHideHotWindows++;
+    else g_runHideHotWindows = 0;
+    g_runHideWindowStart = now;
+    g_runHideOpsWindow = 0;
+    if (g_runHideHotWindows >= 3) { Hider_TripBreaker("sustained", g_runHideHotWindows); return NO; }
+  }
+  g_runHideOpsWindow++;
+  // Hard hang-guard: a synchronous feedback loop that blocks the run loop would
+  // pile ops into one window; cap it so the loop is broken and the Dock settles.
+  if (g_runHideOpsWindow > 6000) { Hider_TripBreaker("hardcap", g_runHideOpsWindow); return NO; }
+  return YES;
+}
+
+// Crash-loop breaker. Called before EVERY layer mutation (not once): keeps the
+// breadcrumb present on disk throughout active mutation and for ~6s after the
+// LAST mutation, so a hard fault (EXC_BAD_ACCESS/SIGBUS — NOT catchable by
+// @try/@catch) at any point during our activity leaves the breadcrumb, and the
+// next Dock launch (Hider_Init) detects it and enters safe mode. The clear is
+// generation-gated so only the most recent arm's timer fires; scheduling is
+// throttled to once/2s so a busy layout pass does not queue thousands of timers.
+static BOOL Hider_IsDOCKProcessTile(id object) {
+  if (!object) return NO;
+  Class processTileClass = NSClassFromString(@"DOCKProcessTile");
+  if (!processTileClass) return NO;
+  @try {
+    return [object isKindOfClass:processTileClass];
+  } @catch (__unused NSException *exception) {
+    return NO;
+  }
+}
+
 
 // Hide sibling indicator/label layers that visually belong to the same tile.
 // Modern Dock keeps DOCKIndicatorLayer/DOCKLabelLayer as siblings of tiles.
@@ -744,6 +764,7 @@ static void Hider_HideNeighborDecorations(CALayer *referenceLayer) {
     sib.hidden  = YES;
   }
 }
+
 
 // Recursively suppress indicator/label layers below a subtree root.
 // Used after hiding a tile/slot to catch deferred indicator rebuilds.
@@ -806,21 +827,6 @@ static void Hider_SuppressSlot(CALayer *tileLayer) {
   [CATransaction commit];
 }
 
-static void Hider_UnsuppressSlot(CALayer *slot) {
-  if (!slot) return;
-  objc_setAssociatedObject(slot, &kHiderSlotSuppressed, nil,
-                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  slot.opacity = 1.0f;
-  slot.hidden  = NO;
-  for (CALayer *sub in Hider_SublayersSnapshot(slot)) {
-    sub.opacity = 1.0f;
-    sub.hidden  = NO;
-  }
-  [CATransaction commit];
-}
-
 // Collect root layers from every reachable source:
 //   1. [NSApp windows]  (may be empty on modern Dock)
 //   2. _orderedWindows  (private NSApplication API)
@@ -873,23 +879,7 @@ static NSArray<CALayer *> *Hider_CollectRootLayers(void) {
   addRoot(g_modernFloorLayer);
   addRoot(g_legacyFloorLayer);
 
-  // Source 4: every tile in g_customAppTileObjects → layer → root.
-  if (g_customAppTileObjects) {
-    NSArray *trackedBIDs = [g_customAppTileObjects allKeys];
-    for (NSString *bid in trackedBIDs) {
-      id tile = g_customAppTileObjects[bid];
-      if (!tile) continue;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-      if ([tile isKindOfClass:[CALayer class]])
-        addRoot((CALayer *)tile);
-      else if ([tile respondsToSelector:@selector(layer)])
-        addRoot([tile performSelector:@selector(layer)]);
-#pragma clang diagnostic pop
-    }
-  }
-
-  // Source 5: Finder / Trash tile objects → layer → root.
+  // Source 4: Finder / Trash tile objects → layer → root.
   void (^addTileRoot)(id) = ^(id tile) {
     if (!tile) return;
 #pragma clang diagnostic push
@@ -923,73 +913,21 @@ static NSArray<CALayer *> *Hider_CollectRootLayers(void) {
   return roots;
 }
 
-// Unified enforcement: discover tiles, suppress renders, apply visibility.
-// Called from init, settings change, and launch observer.
-static void Hider_EnforceHiddenApps(NSString * _Nullable singleBID, pid_t pid) {
+// Force an immediate, animation-free relayout so the Finder/Trash/separator
+// layer-visibility rules (Hider_ApplyVisibilityRecursive → ShouldForceHideLayer
+// / HideFloorSeparators) re-apply. The trash-hide sequence calls this after
+// removing the trash tile so the now-rightmost separator gets hidden in the
+// same frame. Running apps need no work here — prevention keeps their tiles out
+// of the model entirely.
+static void Hider_ApplyLayerVisibility(void) {
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
 
   Hider_TriggerLayoutOnTrackedLayers();
 
-  // ── Step 1: Suppress every already-tracked hidden-app tile directly. ─────
-  // This fires before root-layer discovery so tiles we already know about
-  // are hidden instantly regardless of layer-tree reachability.
-  if (g_customAppTileObjects) {
-    NSSet *snap = [g_hiddenAppBundleIDs copy];
-    for (NSString *bid in snap) {
-      id tile = g_customAppTileObjects[bid];
-      if (tile) Hider_SuppressTileRender(tile);
-    }
-  }
-
-  // ── Step 2: Collect root layers from every reachable source. ─────────────
-  NSArray<CALayer *> *roots = Hider_CollectRootLayers();
-
-  if (roots.count > 0) {
-    // Build PID discovery list for untracked running hidden apps.
-    NSMutableArray *discoveryBIDs = [NSMutableArray array];
-    NSMutableArray *discoveryPIDs = [NSMutableArray array];
-
-    if (singleBID && pid > 0) {
-      [discoveryBIDs addObject:singleBID];
-      [discoveryPIDs addObject:@(pid)];
-    }
-
-    if (g_hiddenAppBundleIDs.count > 0) {
-      NSArray *running = [[NSWorkspace sharedWorkspace] runningApplications];
-      for (NSRunningApplication *ra in running) {
-        NSString *raBID = ra.bundleIdentifier;
-        if (!raBID) continue;
-        NSString *normalized = Hider_NormalizeBundleID(raBID);
-        if (!normalized || ![g_hiddenAppBundleIDs containsObject:normalized])
-          continue;
-        if (g_customAppTileObjects[normalized] &&
-            !(singleBID && [normalized isEqualToString:singleBID]))
-          continue;
-        pid_t raPID = ra.processIdentifier;
-        if (raPID <= 0) continue;
-        [discoveryBIDs addObject:normalized];
-        [discoveryPIDs addObject:@(raPID)];
-      }
-    }
-
-    for (CALayer *root in roots) {
-      for (NSUInteger di = 0; di < discoveryBIDs.count; di++) {
-        Hider_DiscoverTileByPID(root, discoveryBIDs[di],
-                                (pid_t)[discoveryPIDs[di] intValue]);
-      }
-      Hider_ApplyVisibilityRecursive(root);
-      Hider_ForceLayoutRecursive(root);
-    }
-  }
-
-  // ── Step 3: Re-suppress after discovery may have registered new tiles. ───
-  if (g_customAppTileObjects) {
-    NSSet *snap = [g_hiddenAppBundleIDs copy];
-    for (NSString *bid in snap) {
-      id tile = g_customAppTileObjects[bid];
-      if (tile) Hider_SuppressTileRender(tile);
-    }
+  for (CALayer *root in Hider_CollectRootLayers()) {
+    Hider_ApplyVisibilityRecursive(root);
+    Hider_ForceLayoutRecursive(root);
   }
 
   [CATransaction commit];
@@ -1008,63 +946,6 @@ static void Hider_EnforceHiddenApps(NSString * _Nullable singleBID, pid_t pid) {
 //   1) persistent Dock tiles (via Hider_RefreshDock caller), and
 //   2) already-running apps that may currently own transient/running tiles.
 // Called from settings-changed flow with short retries for SwiftUI/Dock timing.
-static void Hider_HotloadHiddenAppsNow(void) {
-  Hider_LoadSettingsFromCache();
-  if (g_hiddenAppBundleIDs.count == 0) {
-    Hider_EnforceHiddenApps(nil, 0);
-    return;
-  }
-
-  NSArray *running = [[NSWorkspace sharedWorkspace] runningApplications];
-  for (NSRunningApplication *app in running) {
-    NSString *bid = Hider_NormalizeBundleID(app.bundleIdentifier);
-    if (!bid || ![g_hiddenAppBundleIDs containsObject:bid]) continue;
-    pid_t appPID = app.processIdentifier;
-    Hider_EnforceHiddenApps(bid, appPID);
-  }
-
-  // Also run a broad pass for any tile identities that were just rebuilt.
-  Hider_EnforceHiddenApps(nil, 0);
-}
-
-// Force one hidden-running-app pass: enforce + explicit tile suppression/removal.
-// This is stronger than Hider_HotloadHiddenAppsNow alone because it asks for
-// tile removal on every pass if a tile object is known.
-static void Hider_ForceHideRunningAppNow(NSString * _Nullable bid, pid_t pid) {
-  Hider_EnforceHiddenApps(bid, pid);
-  if (!bid || bid.length == 0) return;
-  id tile = g_customAppTileObjects[bid];
-  if (!tile) return;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-  SEL ls = @selector(layer);
-  if ([tile respondsToSelector:ls]) {
-    id layerObj = [tile performSelector:ls];
-    if ([layerObj isKindOfClass:[CALayer class]]) {
-      CALayer *l = (CALayer *)layerObj;
-      Hider_HideNeighborDecorations(l);
-      Hider_HideIndicatorsRecursive(l.superlayer ? l.superlayer : l);
-    }
-  }
-#pragma clang diagnostic pop
-  Hider_SuppressTileRender(tile);
-  Hider_RequestTileRemoval(tile);
-}
-
-// Force a broad hidden-app pass over all running hidden apps, including direct
-// remove requests for any tile objects currently known.
-static void Hider_ForceHotloadHiddenTilesNow(void) {
-  Hider_HotloadHiddenAppsNow();
-  if (!g_customAppTileObjects || g_hiddenAppBundleIDs.count == 0) return;
-  NSSet *hiddenSnap = [g_hiddenAppBundleIDs copy];
-  for (NSString *bid in hiddenSnap) {
-    id tile = g_customAppTileObjects[bid];
-    if (!tile) continue;
-    Hider_SuppressTileRender(tile);
-    Hider_RequestTileRemoval(tile);
-  }
-}
-
 #pragma mark - Floor Layer Hiding
 
 static void Hider_HideFloorSeparators(CALayer *layer) {
@@ -1171,113 +1052,6 @@ static void Hider_ApplyVisibilityRecursive(CALayer *layer) {
 //   2. Immediately suppress the layer's visual output.
 // This is the authoritative fallback when Hider_GetBundleID fails for the
 // tile's model object (e.g. a private Swift Dock class with no ObjC selectors).
-static void Hider_DiscoverTileByPID(CALayer *layer, NSString *bid, pid_t pid) {
-  if (!layer || pid <= 0 || !bid) return;
-
-  NSString *cn = NSStringFromClass([layer class]);
-  if ([cn isEqualToString:@"DOCKTileLayer"]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    id delegate = layer.delegate;
-    if (delegate) {
-      BOOL match = NO;
-      // Try -processIdentifier / -pid / -_pid directly on the tile model.
-      SEL pidSel = NSSelectorFromString(@"processIdentifier");
-      SEL pidSel2 = NSSelectorFromString(@"pid");
-      SEL pidSel3 = NSSelectorFromString(@"_pid");
-      SEL pidSels[] = {pidSel, pidSel2, pidSel3};
-      for (int psi = 0; psi < 3 && !match; psi++) {
-        if ([delegate respondsToSelector:pidSels[psi]]) {
-          pid_t p = (pid_t)((int (*)(id, SEL))objc_msgSend)(delegate, pidSels[psi]);
-          if (p == pid) match = YES;
-        }
-      }
-      // Try via -application (returns NSRunningApplication).
-      if (!match) {
-        SEL appSel = NSSelectorFromString(@"application");
-        if ([delegate respondsToSelector:appSel]) {
-          id ra = [delegate performSelector:appSel];
-          if ([ra isKindOfClass:[NSRunningApplication class]] &&
-              [(NSRunningApplication *)ra processIdentifier] == pid)
-            match = YES;
-        }
-      }
-      // Try via -runningApplication.
-      if (!match) {
-        SEL raSel = NSSelectorFromString(@"runningApplication");
-        if ([delegate respondsToSelector:raSel]) {
-          id ra = [delegate performSelector:raSel];
-          if ([ra isKindOfClass:[NSRunningApplication class]] &&
-              [(NSRunningApplication *)ra processIdentifier] == pid)
-            match = YES;
-        }
-      }
-      // Try delegate.item / delegate.model -> processIdentifier / pid.
-      if (!match) {
-        SEL itemSel = NSSelectorFromString(@"item");
-        SEL modelSel = NSSelectorFromString(@"model");
-        id nested = nil;
-        if ([delegate respondsToSelector:itemSel])
-          nested = [delegate performSelector:itemSel];
-        else if ([delegate respondsToSelector:modelSel])
-          nested = [delegate performSelector:modelSel];
-        if (nested) {
-          for (int psi = 0; psi < 3 && !match; psi++) {
-            if ([nested respondsToSelector:pidSels[psi]]) {
-              pid_t p = (pid_t)((int (*)(id, SEL))objc_msgSend)(nested, pidSels[psi]);
-              if (p == pid) match = YES;
-            }
-          }
-        }
-      }
-
-      if (!match) {
-        LOG_TO_FILE("PID no-match: delegate=%s for pid=%d bid=%@",
-                    class_getName([delegate class]), (int)pid, bid);
-      }
-
-      if (match) {
-        LOG_TO_FILE("PID match: registering tile delegate=%s for %@",
-                    class_getName([delegate class]), bid);
-        Hider_RegisterTile(delegate, bid);
-        [layer removeAllAnimations];
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        layer.hidden  = YES;
-        layer.opacity = 0.0f;
-        for (CALayer *sub in Hider_SublayersSnapshot(layer)) {
-          [sub removeAllAnimations];
-          sub.hidden  = YES;
-          sub.opacity = 0.0f;
-        }
-        [CATransaction commit];
-        Hider_SuppressSlot(layer);
-        // Request tile removal so the Dock actually removes it from layout.
-        id tileForRemoval = delegate;
-        SEL dc = NSSelectorFromString(@"doCommand:");
-        SEL pc = NSSelectorFromString(@"performCommand:");
-        if (![delegate respondsToSelector:dc] && ![delegate respondsToSelector:pc]) {
-          id nested = nil;
-          SEL itemSel = @selector(item);
-          SEL modelSel = NSSelectorFromString(@"model");
-          if ([delegate respondsToSelector:itemSel])
-            nested = [delegate performSelector:itemSel];
-          else if ([delegate respondsToSelector:modelSel])
-            nested = [delegate performSelector:modelSel];
-          if (nested && ([nested respondsToSelector:dc] || [nested respondsToSelector:pc]))
-            tileForRemoval = nested;
-        }
-        Hider_RequestTileRemoval(tileForRemoval);
-      }
-    }
-#pragma clang diagnostic pop
-    return; // DOCKTileLayer has no sublayers to recurse into
-  }
-
-  for (CALayer *sub in Hider_SublayersSnapshot(layer))
-    Hider_DiscoverTileByPID(sub, bid, pid);
-}
-
 // Immediately zero out the visual output of a tile object and cancel all
 // in-flight animations on its layer tree.
 //
@@ -1289,48 +1063,6 @@ static void Hider_DiscoverTileByPID(CALayer *layer, NSString *bid, pid_t pid) {
 // The removeAllAnimations call kills the bounce-in CAAnimation before the
 // run-loop ever renders its first frame, which is what lets doCommand:1004
 // be called later without the Dock crashing on a live animation.
-static void Hider_SuppressTileRender(id tile) {
-  if (!tile) return;
-
-  void (^hideLayer)(CALayer *) = ^(CALayer *l) {
-    if (!l) return;
-    [l removeAllAnimations];
-    for (CALayer *sub in Hider_SublayersSnapshot(l))
-      [sub removeAllAnimations];
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    l.hidden  = YES;
-    l.opacity = 0.0f;
-    for (CALayer *sub in Hider_SublayersSnapshot(l)) {
-      sub.hidden  = YES;
-      sub.opacity = 0.0f;
-    }
-    [CATransaction commit];
-    Hider_SuppressSlot(l);
-  };
-
-  if ([tile isKindOfClass:[CALayer class]]) {
-    hideLayer((CALayer *)tile);
-    return;
-  }
-  if ([tile isKindOfClass:[NSView class]]) {
-    NSView *v = (NSView *)tile;
-    [v setHidden:YES];
-    [v setAlphaValue:0.0];
-    hideLayer(v.layer);
-    return;
-  }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-  SEL ls = @selector(layer);
-  if ([tile respondsToSelector:ls]) {
-    id l = [tile performSelector:ls];
-    if ([l isKindOfClass:[CALayer class]])
-      hideLayer((CALayer *)l);
-  }
-#pragma clang diagnostic pop
-}
-
 void Hider_ForceLayoutRecursive(CALayer *layer) {
   if (!layer)
     return;
@@ -1440,16 +1172,6 @@ void Hider_DumpDockHierarchy(void) {
     [output appendString:@"\n"];
   }
 
-  // Also dump tracked tile info.
-  [output appendString:@"=== Tracked Tiles ===\n"];
-  [output appendFormat:@"g_customAppTileObjects count: %lu\n",
-                       (unsigned long)g_customAppTileObjects.count];
-  NSArray *trackedBIDs = [g_customAppTileObjects allKeys];
-  for (NSString *bid in trackedBIDs) {
-    id tile = g_customAppTileObjects[bid];
-    [output appendFormat:@"  %@ → %@ (%p)\n", bid,
-                         NSStringFromClass([tile class]), (void *)tile];
-  }
   [output appendFormat:@"g_hiddenAppBundleIDs: %@\n", g_hiddenAppBundleIDs];
 
   NSError *error = nil;
@@ -1485,9 +1207,12 @@ static void Hider_LoadSettings(void) {
       CFSTR("hideTrash"), CFSTR("com.aspauldingcode.hider"), &keyExists);
   if (!keyExists) g_trashHidden = NO;
 
-  // Separators: always automatic (hide when Trash is hidden)
-  g_hideSeparators = NO;
-  g_separatorMode = 2;  // Auto
+  // Separators: independent toggle (decoupled from Trash) via the
+  // hideSeparators pref. Mode 1 = explicitly remove separators; 0 = keep.
+  g_hideSeparators = (BOOL)CFPreferencesGetAppBooleanValue(
+      CFSTR("hideSeparators"), CFSTR("com.aspauldingcode.hider"), &keyExists);
+  if (!keyExists) g_hideSeparators = NO;
+  g_separatorMode = g_hideSeparators ? 1 : 0;
 
   // Custom hidden apps
   Hider_LoadCustomAppsFromPrefs();
@@ -1510,9 +1235,12 @@ static void Hider_LoadSettingsFromCache(void) {
       CFSTR("hideTrash"), CFSTR("com.aspauldingcode.hider"), &keyExists);
   if (!keyExists) g_trashHidden = NO;
 
-  // Separators: always automatic (hide when Trash is hidden)
-  g_hideSeparators = NO;
-  g_separatorMode = 2;  // Auto
+  // Separators: independent toggle (decoupled from Trash) via the
+  // hideSeparators pref. Mode 1 = explicitly remove separators; 0 = keep.
+  g_hideSeparators = (BOOL)CFPreferencesGetAppBooleanValue(
+      CFSTR("hideSeparators"), CFSTR("com.aspauldingcode.hider"), &keyExists);
+  if (!keyExists) g_hideSeparators = NO;
+  g_separatorMode = g_hideSeparators ? 1 : 0;
 
   // Update custom hidden-apps set from cache (no disk sync, allocation-light
   // because CFPreferences caches the plist in memory).
@@ -1612,9 +1340,11 @@ static void Hider_WriteFinderPref(void) {
 static NSMutableArray *g_savedSeparatorPrefs = nil; // array of {section, index, item} dicts
 
 static BOOL Hider_ShouldRemoveSeparators(void) {
+  // Independent of Trash now: separators are removed only when the user turns on
+  // the dedicated hideSeparators toggle (g_hideSeparators / mode 1), never as a
+  // side effect of hiding Trash.
   return g_hideSeparators ||
          (g_separatorMode == 1) ||
-         (g_separatorMode == 2 && g_trashHidden) ||
          g_deferSeparatorRestore;
 }
 
@@ -1743,11 +1473,6 @@ static void Hider_RefreshDock(void) {
   if (CoreDockSetTileHidden) {
     CoreDockSetTileHidden(kCoreDockFinderBundleID, (Boolean)g_finderHidden);
     CoreDockSetTileHidden(kCoreDockTrashBundleID,  (Boolean)g_trashHidden);
-    // Apply to every custom-hidden app using the same CoreDock API.
-    NSSet *hiddenSnap = [g_hiddenAppBundleIDs copy];
-    for (NSString *bid in hiddenSnap) {
-      CoreDockSetTileHidden((__bridge CFStringRef)bid, YES);
-    }
   }
 
   // ── Separators ──────────────────────────────────────────────────────────────
@@ -1797,79 +1522,12 @@ static void Hider_RefreshDock(void) {
     }
   }
 
-  // Step 2: un-suppress apps that were removed from the hidden list.
-  if (g_prevHiddenAppBundleIDs && g_customAppTileObjects) {
-    NSSet *prevSnap = [g_prevHiddenAppBundleIDs copy];
-    for (NSString *bid in prevSnap) {
-      if (![g_hiddenAppBundleIDs containsObject:bid]) {
-        id tile = g_customAppTileObjects[bid];
-        if (!tile) continue;
-        // Clear the associated bundle-ID tag so layer hooks stop blocking.
-        objc_setAssociatedObject(tile, &kHiderBundleIDTag, nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        // Allow one fresh removal command if this tile is hidden again later.
-        objc_setAssociatedObject(tile, &kHiderCustomAppRemoveKey, nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        SEL ls = @selector(layer);
-        if ([tile respondsToSelector:ls]) {
-          CALayer *l = [tile performSelector:ls];
-          if ([l isKindOfClass:[CALayer class]]) {
-            CALayer *slot = l.superlayer;
-            if (slot) Hider_UnsuppressSlot(slot);
-          }
-        }
-#pragma clang diagnostic pop
-        [g_customAppTileObjects removeObjectForKey:bid];
-      }
-    }
-  }
-
-  // Step 3: suppress + schedule removal for every hidden app.
-  if (g_hiddenAppBundleIDs.count > 0 && g_customAppTileObjects) {
-    NSSet *hiddenSnap = [g_hiddenAppBundleIDs copy];
-    for (NSString *bid in hiddenSnap) {
-      id tile = g_customAppTileObjects[bid];
-      if (tile) Hider_SuppressTileRender(tile);
-    }
-  }
-
-  if (g_hiddenAppBundleIDs.count > 0) {
-    NSSet *hiddenSnap = [g_hiddenAppBundleIDs copy];
-    void (^removeTiles)(void) = ^{
-      if (!g_customAppTileObjects) return;
-      for (NSString *bid in hiddenSnap) {
-        id tile = g_customAppTileObjects[bid];
-        if (!tile) continue;
-        LOG_TO_FILE("Hider_RefreshDock: removing tile for %@", bid);
-        Hider_RequestTileRemoval(tile);
-      }
-    };
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), removeTiles);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), removeTiles);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), removeTiles);
-  }
-  g_prevHiddenAppBundleIDs = [g_hiddenAppBundleIDs copy];
+  // Running apps in the hidden set need no per-refresh suppression here: they
+  // are removed from persistent-apps above (Step 1) and PREVENTION refuses
+  // their tile on the Dock rebuild this refresh triggers. Nothing to enforce.
 
   // ── Notify Dock to reconcile ─────────────────────────────────────────────
   Hider_PostDockPrefsChangedNotification();
-
-  // Unified enforcement passes at 0, 100, 300, 600 ms.
-  void (^applyPass)(void) = ^{
-    Hider_EnforceHiddenApps(nil, 0);
-  };
-
-  dispatch_async(dispatch_get_main_queue(), applyPass);
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
-                 dispatch_get_main_queue(), applyPass);
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
-                 dispatch_get_main_queue(), applyPass);
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_MSEC),
-                 dispatch_get_main_queue(), applyPass);
 
   // Staggered sequence when hiding trash: 1) trash invisible (layout above),
   // 2) remove trash tile, 3) rightmost separator invisible (layout), 4) remove
@@ -1908,7 +1566,7 @@ static void Hider_RefreshDock(void) {
       if ([trashTile respondsToSelector:d])
         ((void (*)(id, SEL, int))objc_msgSend)(trashTile, d, 1004);
       // 3. Trigger layout so rightmost separator gets hidden
-      applyPass();
+      Hider_ApplyLayerVisibility();
       // 4. Remove only the rightmost live DOCKSeparatorTile.
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((step4Ms - step2Ms) * NSEC_PER_MSEC)),
                      dispatch_get_main_queue(), ^{
@@ -2222,7 +1880,8 @@ static void swizzleCALayer(void) {
     void (^layoutBlock)(id) = ^(id self) {
       ((void (*)(id, SEL))originalLayoutIMP)(self, layoutSublayersSel);
 
-      if ([NSStringFromClass([self class]) isEqualToString:@"DOCKTileLayer"]) {
+      NSString *cn = NSStringFromClass([self class]);
+      if ([cn isEqualToString:@"DOCKTileLayer"]) {
         if (Hider_ShouldForceHideLayer((CALayer *)self)) {
           [(CALayer *)self setHidden:YES];
           [(CALayer *)self setOpacity:0.0f];
@@ -2233,7 +1892,6 @@ static void swizzleCALayer(void) {
         [(CALayer *)self setOpacity:0.0f];
       }
 
-      NSString *cn = NSStringFromClass([self class]);
       if ([cn containsString:@"FloorLayer"] || [cn containsString:@"Container"]) {
         Hider_HideFloorSeparators((CALayer *)self);
       }
@@ -2289,7 +1947,6 @@ static void swizzleNSView(void) {
     if (bundleID) {
       if (Hider_IsFinder(bundleID) && g_finderHidden)    forceHide = YES;
       else if (Hider_IsTrash(bundleID) && g_trashHidden) forceHide = YES;
-      else if (Hider_IsCustomHiddenApp(bundleID))         forceHide = YES;
     }
 
     ((void (*)(id, SEL, BOOL))originalIMP)(self, setHiddenSel,
@@ -2312,7 +1969,6 @@ static void swizzleNSView(void) {
         if (bid) {
           if (Hider_IsFinder(bid) && g_finderHidden)       forceZero = YES;
           else if (Hider_IsTrash(bid) && g_trashHidden)    forceZero = YES;
-          else if (Hider_IsCustomHiddenApp(bid))            forceZero = YES;
         }
       }
       if (forceZero)
@@ -2406,7 +2062,6 @@ static void swizzleDOCKFileTile(Class cls) {
 
   id (^block)(id) = ^id(id self) {
     NSString *bundleID = Hider_GetBundleID(self);
-    if (!bundleID) bundleID = Hider_ResolveBundleIDByPID(self);
 
     if (bundleID && Hider_IsFinder(bundleID)) {
       g_finderTileObject = self;
@@ -2418,13 +2073,6 @@ static void swizzleDOCKFileTile(Class cls) {
           ((void (*)(id, SEL, int))objc_msgSend)(self, pc, 1004);
       });
 #pragma clang diagnostic pop
-    } else if (bundleID && !Hider_IsTrash(bundleID)) {
-      Hider_RegisterTile(self, bundleID);
-
-      if (Hider_IsCustomHiddenApp(bundleID)) {
-        Hider_SuppressTileRender(self);
-        Hider_RequestTileRemoval(self);
-      }
     }
 
     // Call the original IMP first — it may add animations to the tile layer.
@@ -2438,81 +2086,14 @@ static void swizzleDOCKFileTile(Class cls) {
     // Retry bundle-ID probe after originalIMP when the tile is fully set up.
     if (!bundleID) {
       bundleID = Hider_GetBundleID(self);
-      if (!bundleID) bundleID = Hider_ResolveBundleIDByPID(self);
-      if (bundleID && Hider_IsFinder(bundleID)) {
+      if (bundleID && Hider_IsFinder(bundleID))
         g_finderTileObject = self;
-      } else if (bundleID && !Hider_IsTrash(bundleID)) {
-        Hider_RegisterTile(self, bundleID);
-        if (Hider_IsCustomHiddenApp(bundleID)) {
-          Hider_SuppressTileRender(self);
-          Hider_RequestTileRemoval(self);
-        }
-      }
     }
-
-    if (bundleID && Hider_IsCustomHiddenApp(bundleID))
-      Hider_SuppressIfHidden(self);
 
     return result;
   };
   class_replaceMethod(cls, updateSel, imp_implementationWithBlock(block),
                       method_getTypeEncoding(originalMethod));
-
-  // ── DOCKFileTile lifecycle swizzles ─────────────────────────────────────
-  // Same treatment as swizzleGenericAppTile: intercept every state setter and
-  // void lifecycle method so the Dock cannot re-show a hidden tile when the
-  // app becomes active or running.
-  NSArray *ftBoolSetterNames = @[
-    @"setActive:", @"setRunning:", @"setLaunching:",
-    @"setShowsIndicator:", @"setIsRunning:", @"setIsActive:",
-    @"setNeedsRedraw:", @"setShowIndicator:",
-    @"setHighlighted:", @"setVisible:",
-  ];
-  for (NSString *selName in ftBoolSetterNames) {
-    SEL sel = NSSelectorFromString(selName);
-    if (![cls instancesRespondToSelector:sel]) continue;
-
-    Method method = class_getInstanceMethod(cls, sel);
-    if (!method) continue;
-    __block IMP origIMP = method_getImplementation(method);
-    __block SEL capturedSel = sel;
-
-    void (^stateBlock)(id, BOOL) = ^(id self, BOOL val) {
-      ((void (*)(id, SEL, BOOL))origIMP)(self, capturedSel, val);
-      Hider_SuppressIfHidden(self);
-    };
-
-    NSString *newSelName = [NSString stringWithFormat:@"hider_ft_%@", selName];
-    Hider_SwizzleInstanceMethod(cls, sel, NSSelectorFromString(newSelName),
-                                imp_implementationWithBlock(stateBlock));
-  }
-
-  NSArray *ftVoidMethodNames = @[
-    @"updateRunningIndicator", @"_updateRunningIndicator",
-    @"updateIndicator", @"_updateIndicator",
-    @"updateVisibility", @"_updateVisibility",
-    @"display", @"_display",
-    @"updateIconImage", @"_updateIconImage",
-    @"redisplay",
-  ];
-  for (NSString *selName in ftVoidMethodNames) {
-    SEL sel = NSSelectorFromString(selName);
-    if (![cls instancesRespondToSelector:sel]) continue;
-
-    Method method = class_getInstanceMethod(cls, sel);
-    if (!method) continue;
-    __block IMP origIMP = method_getImplementation(method);
-    __block SEL capturedSel = sel;
-
-    void (^voidBlock)(id) = ^(id self) {
-      ((void (*)(id, SEL))origIMP)(self, capturedSel);
-      Hider_SuppressIfHidden(self);
-    };
-
-    NSString *newSelName = [NSString stringWithFormat:@"hider_ft_v_%@", selName];
-    Hider_SwizzleInstanceMethod(cls, sel, NSSelectorFromString(newSelName),
-                                imp_implementationWithBlock(voidBlock));
-  }
 }
 
 static void swizzleDOCKSpacerTile(Class cls) {
@@ -2657,248 +2238,9 @@ static void swizzleDOCKFloorLayer(Class cls) {
 // Request tile removal with immediate+retry passes.
 // This is centralized so every detection path (update/init, bundleIdentifier,
 // fileURL, lifecycle state hooks) can trigger the same robust remove flow.
-static void Hider_RequestTileRemoval(id tile) {
-  if (!tile) return;
-  Hider_RunOnce(tile, &kHiderCustomAppRemoveKey, ^{
-    __weak id weakTile = tile;
-    int64_t delays[] = {0, 80, 250, 900};
-    for (int i = 0; i < 4; i++) {
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delays[i] * (int64_t)NSEC_PER_MSEC),
-                     dispatch_get_main_queue(), ^{
-                       id t = weakTile;
-                       if (!t) return;
-                       Hider_SuppressTileRender(t);
-                       // Keep retry passes visual-only; emit remove command once
-                       // so each icon produces at most one whoosh.
-                       if (i != 0) return;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                       SEL dc = NSSelectorFromString(@"doCommand:");
-                       SEL pc = NSSelectorFromString(@"performCommand:");
-                       if ([t respondsToSelector:dc])
-                         ((void (*)(id, SEL, int))objc_msgSend)(t, dc, 1004);
-                       else if ([t respondsToSelector:pc])
-                         ((void (*)(id, SEL, int))objc_msgSend)(t, pc, 1004);
-#pragma clang diagnostic pop
-                     });
-    }
-  });
-}
-
 // Helper: if `tile` is a hidden custom app, immediately suppress and remove.
 // Uses three resolution paths: associated-object tag → Hider_GetBundleID →
 // PID-based fallback via Hider_ResolveBundleIDByPID.
-static void Hider_SuppressIfHidden(id tile) {
-  if (!tile) return;
-  NSString *bid = objc_getAssociatedObject(tile, &kHiderBundleIDTag);
-  if (!bid) bid = Hider_NormalizeBundleID(Hider_GetBundleID(tile));
-  if (!bid) bid = Hider_ResolveBundleIDByPID(tile);
-  if (!bid || !Hider_IsCustomHiddenApp(bid)) return;
-  Hider_RegisterTile(tile, bid);
-  Hider_SuppressTileRender(tile);
-  Hider_RequestTileRemoval(tile);
-}
-
-// swizzleGenericAppTile – intercepts any DOCK tile class that isn't Finder /
-// Trash / separator.  Tracks every tile unconditionally (mirrors how
-// g_finderTileObject is always populated) and sends doCommand:1004 when
-// the tile's bundle ID is in the custom-hidden set.
-//
-// In addition to the -update/-init swizzle, this function also hooks every
-// lifecycle selector the Dock uses to transition tiles between inactive,
-// running, active, and launching states.  Without these hooks, the Dock's
-// own state machinery re-shows the tile icon whenever the app becomes active
-// or starts running — even if we previously suppressed it.
-static void swizzleGenericAppTile(Class cls) {
-  SEL updateSel = NSSelectorFromString(@"update");
-  if (![cls instancesRespondToSelector:updateSel])
-    updateSel = @selector(init);
-
-  Method m = class_getInstanceMethod(cls, updateSel);
-  if (!m)
-    return;
-  __block IMP orig = method_getImplementation(m);
-
-  id (^block)(id) = ^id(id self) {
-    NSString *bundleID = Hider_GetBundleID(self);
-    // PID fallback when Hider_GetBundleID can't resolve the bundle ID.
-    if (!bundleID) bundleID = Hider_ResolveBundleIDByPID(self);
-
-    if (bundleID && !Hider_IsFinder(bundleID) && !Hider_IsTrash(bundleID)) {
-      Hider_RegisterTile(self, bundleID);
-      // Pre-original: only attempt suppression when layer already exists.
-      if (Hider_IsCustomHiddenApp(bundleID)) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        SEL ls = @selector(layer);
-        if ([self respondsToSelector:ls]) {
-          id l = [self performSelector:ls];
-          if ([l isKindOfClass:[CALayer class]])
-            Hider_SuppressTileRender(self);
-        }
-#pragma clang diagnostic pop
-      }
-    }
-
-    id result = nil;
-    if (updateSel == @selector(init))
-      result = ((id(*)(id, SEL))orig)(self, updateSel);
-    else
-      ((void (*)(id, SEL))orig)(self, updateSel);
-
-    // Post-original: resolve identity again and enforce in same stack frame.
-    bundleID = Hider_GetBundleID(self);
-    if (!bundleID) bundleID = Hider_ResolveBundleIDByPID(self);
-    if (bundleID && !Hider_IsFinder(bundleID) && !Hider_IsTrash(bundleID)) {
-      Hider_RegisterTile(self, bundleID);
-      if (Hider_IsCustomHiddenApp(bundleID)) {
-        Hider_SuppressTileRender(self);
-        Hider_RequestTileRemoval(self);
-      }
-    }
-
-    if (bundleID && Hider_IsCustomHiddenApp(bundleID))
-      Hider_SuppressIfHidden(self);
-
-    return result;
-  };
-  class_replaceMethod(cls, updateSel, imp_implementationWithBlock(block),
-                      method_getTypeEncoding(m));
-
-  // Identity getters (critical for DOCKProcessTile): when Dock resolves tile
-  // identity via bundleIdentifier/fileURL, immediately apply hide/removal.
-  SEL bundleIDSel = @selector(bundleIdentifier);
-  if ([cls instancesRespondToSelector:bundleIDSel]) {
-    Method bidMethod = class_getInstanceMethod(cls, bundleIDSel);
-    if (bidMethod) {
-      __block IMP origBid = method_getImplementation(bidMethod);
-      id (^bidBlock)(id) = ^id(id self) {
-        id value = ((id (*)(id, SEL))origBid)(self, bundleIDSel);
-        if ([value isKindOfClass:[NSString class]]) {
-          NSString *bid = Hider_NormalizeBundleID((NSString *)value);
-          if (bid.length > 0) {
-            Hider_RegisterTile(self, bid);
-            if (Hider_IsCustomHiddenApp(bid)) {
-              Hider_SuppressTileRender(self);
-              Hider_RequestTileRemoval(self);
-            }
-          }
-        }
-        return value;
-      };
-      Hider_SwizzleInstanceMethod(
-          cls, bundleIDSel, NSSelectorFromString(@"hider_generic_bundleIdentifier"),
-          imp_implementationWithBlock(bidBlock));
-    }
-  }
-
-  SEL fileURLSel = @selector(fileURL);
-  if ([cls instancesRespondToSelector:fileURLSel]) {
-    Method urlMethod = class_getInstanceMethod(cls, fileURLSel);
-    if (urlMethod) {
-      __block IMP origURL = method_getImplementation(urlMethod);
-      id (^urlBlock)(id) = ^id(id self) {
-        id value = ((id (*)(id, SEL))origURL)(self, fileURLSel);
-        if ([value isKindOfClass:[NSURL class]]) {
-          NSBundle *b = [NSBundle bundleWithURL:(NSURL *)value];
-          NSString *bid = Hider_NormalizeBundleID(b.bundleIdentifier);
-          if (bid.length > 0) {
-            Hider_RegisterTile(self, bid);
-            if (Hider_IsCustomHiddenApp(bid)) {
-              Hider_SuppressTileRender(self);
-              Hider_RequestTileRemoval(self);
-            }
-          }
-        }
-        return value;
-      };
-      Hider_SwizzleInstanceMethod(
-          cls, fileURLSel, NSSelectorFromString(@"hider_generic_fileURL"),
-          imp_implementationWithBlock(urlBlock));
-    }
-  }
-
-  // ── Lifecycle swizzles ──────────────────────────────────────────────────
-  // Hook every BOOL-taking state setter that the Dock uses to bring a tile
-  // back to life when the app becomes active/running/launching.  After
-  // calling through to the original, we immediately re-suppress the tile.
-  NSArray *boolSetterNames = @[
-    @"setActive:", @"setRunning:", @"setLaunching:",
-    @"setShowsIndicator:", @"setIsRunning:", @"setIsActive:",
-    @"setNeedsRedraw:", @"setShowIndicator:",
-    @"setHighlighted:", @"setVisible:",
-  ];
-  for (NSString *selName in boolSetterNames) {
-    SEL sel = NSSelectorFromString(selName);
-    if (![cls instancesRespondToSelector:sel]) continue;
-
-    Method method = class_getInstanceMethod(cls, sel);
-    if (!method) continue;
-    __block IMP origIMP = method_getImplementation(method);
-    __block SEL capturedSel = sel;
-
-    void (^stateBlock)(id, BOOL) = ^(id self, BOOL val) {
-      ((void (*)(id, SEL, BOOL))origIMP)(self, capturedSel, val);
-      Hider_SuppressIfHidden(self);
-    };
-
-    NSString *newSelName = [NSString stringWithFormat:@"hider_generic_%@", selName];
-    Hider_SwizzleInstanceMethod(cls, sel, NSSelectorFromString(newSelName),
-                                imp_implementationWithBlock(stateBlock));
-  }
-
-  // Hook void-returning no-arg lifecycle methods that rebuild tile visuals.
-  NSArray *voidMethodNames = @[
-    @"updateRunningIndicator", @"_updateRunningIndicator",
-    @"updateIndicator", @"_updateIndicator",
-    @"updateVisibility", @"_updateVisibility",
-    @"display", @"_display",
-    @"updateIconImage", @"_updateIconImage",
-    @"redisplay",
-  ];
-  for (NSString *selName in voidMethodNames) {
-    SEL sel = NSSelectorFromString(selName);
-    if (![cls instancesRespondToSelector:sel]) continue;
-
-    Method method = class_getInstanceMethod(cls, sel);
-    if (!method) continue;
-    __block IMP origIMP = method_getImplementation(method);
-    __block SEL capturedSel = sel;
-
-    void (^voidBlock)(id) = ^(id self) {
-      ((void (*)(id, SEL))origIMP)(self, capturedSel);
-      Hider_SuppressIfHidden(self);
-    };
-
-    NSString *newSelName = [NSString stringWithFormat:@"hider_generic_v_%@", selName];
-    Hider_SwizzleInstanceMethod(cls, sel, NSSelectorFromString(newSelName),
-                                imp_implementationWithBlock(voidBlock));
-  }
-
-  // One-time: dump interesting selectors for DOCKProcessTile so we can see
-  // how it exposes PID/bundleID at runtime.
-  if (strcmp(class_getName(cls), "DOCKProcessTile") == 0) {
-    NSArray *probeNames = @[
-      @"processIdentifier", @"pid", @"_pid",
-      @"bundleIdentifier", @"bundleID", @"_bundleID",
-      @"application", @"runningApplication",
-      @"item", @"model", @"objectValue",
-      @"url", @"fileURL", @"URL",
-      @"setActive:", @"setRunning:", @"setLaunching:",
-      @"update", @"init",
-      @"applicationBundleIdentifier", @"appBundleID",
-    ];
-    NSMutableString *found = [NSMutableString string];
-    for (NSString *s in probeNames) {
-      if ([cls instancesRespondToSelector:NSSelectorFromString(s)])
-        [found appendFormat:@" %@", s];
-    }
-    LOG_TO_FILE("DOCKProcessTile selectors:%@", found);
-  }
-
-  LOG_TO_FILE("swizzleGenericAppTile: %s", class_getName(cls));
-}
-
 static void swizzleDockCoreClasses(void) {
   if (NSClassFromString(@"DOCKTileLayer"))
     swizzleDOCKTileLayer();
@@ -2934,14 +2276,6 @@ static void swizzleDockCoreClasses(void) {
                  strcmp(name, "DOCKSpacerTile") == 0) {
         LOG_TO_FILE("Swizzling spacer/separator class: %s", name);
         swizzleDOCKSpacerTile(classes[i]);
-      } else if (strstr(name, "Tile") != NULL &&
-                 !strstr(name, "TileLayer")) {
-        // Catch all remaining DOCK tile classes — DOCKApplicationTile,
-        // DOCKURLTile, DOCKRunningAppTile, etc. — for custom hidden-app
-        // tracking.  The already-handled classes above are excluded by the
-        // if/else chain so there is no double-swizzle risk.
-        LOG_TO_FILE("Swizzling generic tile class: %s", name);
-        swizzleGenericAppTile(classes[i]);
       }
     }
   }
@@ -2958,11 +2292,70 @@ static int tokenDump, tokenPrepareRestart;
 // Debounce: coalesce rapid settingsChanged bursts into one refresh
 static BOOL g_pendingRefresh = NO;
 
+// Crash-loop guard. A crash on our code (e.g. an insertTile prevention trap
+// during a relaunch's addProcessForASN storm) makes launchd relaunch the Dock,
+// which re-runs us, which can crash again — a wedge that leaves the Dock down.
+// We must catch that WITHOUT false-positiving on INTENTIONAL relaunches (a
+// hide/unhide, or a burst of toggles, auto-relaunches the Dock — sometimes
+// several times in quick succession, faster than any survival window).
+// So the controller (GUI/CLI) drops /tmp/hider-intentional-restart right before
+// it kills the Dock: if this launch follows that marker it is intentional, so we
+// consume the marker, RESET the counter, and exempt the launch. A real crash
+// leaves no marker, so it still counts; each launch bumps /tmp/hider-launch-count
+// and a 12s survival timer clears it, and at the limit we enter safe mode and
+// disable the opt-in so the Dock comes up clean. Returns YES if it tripped.
+static BOOL Hider_CrashLoopGuard(void) {
+  NSFileManager *fm = [NSFileManager defaultManager];
+  NSString *countPath = @"/tmp/hider-launch-count";
+  NSString *markerPath = @"/tmp/hider-intentional-restart";
+  if ([fm fileExistsAtPath:markerPath]) {
+    NSDate *when = [[fm attributesOfItemAtPath:markerPath error:NULL]
+        fileModificationDate];
+    [fm removeItemAtPath:markerPath error:NULL];  // one-shot: consume it
+    if (when && [[NSDate date] timeIntervalSinceDate:when] < 30.0) {
+      [fm removeItemAtPath:countPath error:NULL];  // intentional -> reset
+      return NO;
+    }
+  }
+  NSInteger count =
+      [[NSString stringWithContentsOfFile:countPath
+                                 encoding:NSUTF8StringEncoding
+                                    error:NULL] integerValue] +
+      1;
+  [[NSString stringWithFormat:@"%ld", (long)count]
+      writeToFile:countPath
+       atomically:YES
+         encoding:NSUTF8StringEncoding
+            error:NULL];
+  if (count >= 3) {
+    g_runHideSafeMode = YES;
+    CFPreferencesSetAppValue(CFSTR("hideRunningApps"), kCFBooleanFalse,
+                             CFSTR("com.aspauldingcode.hider"));
+    CFPreferencesAppSynchronize(CFSTR("com.aspauldingcode.hider"));
+    [fm removeItemAtPath:@"/tmp/hider-run-hide" error:NULL];
+    [fm removeItemAtPath:countPath error:NULL];
+    LOG_TO_FILE("CRASH-LOOP GUARD: %ld launches without surviving -> SAFE MODE, "
+                "running-app hiding disabled",
+                (long)count);
+    return YES;
+  }
+  int64_t gen = ++g_launchGen;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   if (gen != g_launchGen) return;  // superseded
+                   [[NSFileManager defaultManager] removeItemAtPath:countPath
+                                                              error:NULL];
+                 });
+  return NO;
+}
+
 __attribute__((constructor)) static void Hider_Init(void) {
   @autoreleasepool {
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     if (![bundleID isEqualToString:@"com.apple.dock"])
       return;
+
+    Hider_CrashLoopGuard();
 
     LOG_TO_FILE("Hider_Init: starting");
 
@@ -2970,6 +2363,7 @@ __attribute__((constructor)) static void Hider_Init(void) {
     swizzleDockCoreClasses();
     swizzleCALayer();
     swizzleNSView();
+    Hider_SwizzleDockBarAddTile();  // prevention: refuse tiles for hidden apps
 
     // On initial injection apply current settings so a freshly-restarted Dock
     // starts with the correct pref state (e.g. separators absent when trash is
@@ -3001,45 +2395,12 @@ __attribute__((constructor)) static void Hider_Init(void) {
                 g_pendingRefresh = NO;
                 LOG_TO_FILE("Settings changed — applying");
                 Hider_LoadSettings();
+                // RefreshDock applies Finder/Trash/separator prefs AND re-runs
+                // the hidden-app enforcement pass. Running apps are hidden by
+                // PREVENTION on the Dock rebuild that every supported apply path
+                // triggers, so no separate hotload is needed here.
                 Hider_RefreshDock();
-
-                // Hidden-app list must hotload immediately (same expectation as
-                // Finder/Trash toggles): apply now + short retries to catch
-                // async Dock model/layout churn.
-                void (^hotloadPass)(void) = ^{
-                  Hider_ForceHotloadHiddenTilesNow();
-                };
-                dispatch_async(dispatch_get_main_queue(), hotloadPass);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
-                               dispatch_get_main_queue(), hotloadPass);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                               dispatch_get_main_queue(), hotloadPass);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC),
-                               dispatch_get_main_queue(), hotloadPass);
               });
-        });
-
-    // Hidden app added — apply immediately (no debounce), same as Finder/Trash hide.
-    int hiddenAppAddedToken;
-    notify_register_dispatch(
-        "com.aspauldingcode.hider.hiddenAppAdded", &hiddenAppAddedToken,
-        dispatch_get_main_queue(), ^(__unused int t) {
-          LOG_TO_FILE("Hidden app added — applying immediately");
-          Hider_LoadSettings();
-          // Mirror Finder/Trash immediate refresh path.
-          Hider_HideFinderIcon((Boolean)g_finderHidden);
-          Hider_HideTrashIcon((Boolean)g_trashHidden);
-          // Retry passes mirror launch handling so already-running apps are
-          // hidden even when Dock model/layers are still converging.
-          void (^hotloadPass)(void) = ^{
-            Hider_ForceHotloadHiddenTilesNow();
-          };
-          dispatch_async(dispatch_get_main_queue(), hotloadPass);
-          int64_t retryMs[] = {25, 75, 150, 300, 600, 1000};
-          for (int i = 0; i < 6; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, retryMs[i] * (int64_t)NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), hotloadPass);
-          }
         });
 
     notify_register_dispatch("com.hider.finder.hide", &tokenHideFinder,
@@ -3108,91 +2469,13 @@ __attribute__((constructor)) static void Hider_Init(void) {
                                Hider_HideTrashIcon(NO);
                              });
 
-    // Watch for app launches: hidden apps must be suppressed immediately.
-    // Uses Hider_EnforceHiddenApps (which does PID discovery + _rootLayer
-    // fallback + layer suppression + slot tagging) on an aggressive schedule
-    // so the icon never visually appears, even briefly.
-    [[[NSWorkspace sharedWorkspace] notificationCenter]
-        addObserverForName:NSWorkspaceDidLaunchApplicationNotification
-        object:nil
-        queue:[NSOperationQueue mainQueue]
-        usingBlock:^(NSNotification *note) {
-          NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
-          NSString *bid = app.bundleIdentifier;
-          Hider_LoadSettingsFromCache();
-          if (!bid || !Hider_IsCustomHiddenApp(bid)) return;
-
-          LOG_TO_FILE("Hidden app launched: %@", bid);
-          NSString *normalized = Hider_NormalizeBundleID(bid);
-          pid_t appPID = app.processIdentifier;
-
-          // Synchronous pass first, then progressive retries.
-          Hider_ForceHideRunningAppNow(normalized, appPID);
-          int64_t delays[] = {0, 25, 75, 200, 500, 900, 1500};
-          for (int di = 0; di < 7; di++) {
-            dispatch_after(
-                dispatch_time(DISPATCH_TIME_NOW, delays[di] * (int64_t)NSEC_PER_MSEC),
-                dispatch_get_main_queue(), ^{
-                  Hider_ForceHideRunningAppNow(normalized, appPID);
-                });
-          }
-
-          // Tile removal — after any launch animation is complete.
-          dispatch_after(
-              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
-              dispatch_get_main_queue(), ^{
-                Hider_ForceHideRunningAppNow(normalized, appPID);
-              });
-        }];
-
-    // Watch for app activations: when a hidden app becomes the active
-    // (frontmost) app, the Dock normally re-shows its tile and indicator.
-    // Re-suppress immediately so the tile never visually reappears.
-    [[[NSWorkspace sharedWorkspace] notificationCenter]
-        addObserverForName:NSWorkspaceDidActivateApplicationNotification
-        object:nil
-        queue:[NSOperationQueue mainQueue]
-        usingBlock:^(NSNotification *note) {
-          NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
-          NSString *bid = app.bundleIdentifier;
-          Hider_LoadSettingsFromCache();
-          if (!bid || !Hider_IsCustomHiddenApp(bid)) return;
-
-          LOG_TO_FILE("Hidden app activated: %@", bid);
-          NSString *normalized = Hider_NormalizeBundleID(bid);
-          pid_t appPID = app.processIdentifier;
-
-          int64_t delays[] = {0, 50, 150, 400};
-          for (int di = 0; di < 4; di++) {
-            dispatch_after(
-                dispatch_time(DISPATCH_TIME_NOW, delays[di] * (int64_t)NSEC_PER_MSEC),
-                dispatch_get_main_queue(), ^{
-                  Hider_ForceHideRunningAppNow(normalized, appPID);
-                });
-          }
-        }];
-
-    // Watch for app deactivations: the Dock updates indicator state when an
-    // app resigns active status.  Re-suppress so indicator dots don't creep
-    // back in for hidden apps.
-    [[[NSWorkspace sharedWorkspace] notificationCenter]
-        addObserverForName:NSWorkspaceDidDeactivateApplicationNotification
-        object:nil
-        queue:[NSOperationQueue mainQueue]
-        usingBlock:^(NSNotification *note) {
-          NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
-          NSString *bid = app.bundleIdentifier;
-          Hider_LoadSettingsFromCache();
-          if (!bid || !Hider_IsCustomHiddenApp(bid)) return;
-
-          NSString *normalized = Hider_NormalizeBundleID(bid);
-          pid_t appPID = app.processIdentifier;
-          dispatch_after(
-              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)),
-              dispatch_get_main_queue(), ^{
-                Hider_ForceHideRunningAppNow(normalized, appPID);
-              });
-        }];
+    // Hidden RUNNING apps need no NSWorkspace launch/activate/deactivate
+    // observers: PREVENTION (the insertTile hook) refuses a hidden app's tile
+    // on every path it could enter the model — a fresh launch
+    // (_handleLaunchNotification) and a Dock rebuild (addProcessForASN) — so the
+    // tile never exists to re-show on activation. Verified: launching a hidden
+    // app while the Dock is up logs an insertTile SKIP for both reasons and the
+    // tile never appears.
 
     LOG_TO_FILE("Hider_Init: complete");
   }

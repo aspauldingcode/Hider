@@ -1,4 +1,4 @@
-#include "notify_bridge.h"
+#include "include/notify_bridge.h"
 #include <notify.h>
 
 void post_notification(const char *name) {
